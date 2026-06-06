@@ -1,118 +1,71 @@
-# ============================================================
-# .github/workflows/build.yml — Buddy Guard APK builder
-#
-# Fixes applied vs original:
-#   1. REMOVED "Create buildozer.spec" step — repo's own spec is used
-#   2. Python 3.10 (matches p4a toolchain; no version pin in spec)
-#   3. Cython 0.29.37 (supports Python 3.10, not 0.29.33)
-#   4. Added missing system deps (libsqlite3-dev, libpng-dev, etc.)
-#   5. JAVA_HOME set explicitly from setup-java output
-#   6. Added ~/.buildozer cache → builds go from 45 min → ~8 min
-#   7. Added ~/.android/repositories.cfg before SDK acceptance
-#   8. Added p4a Python deps that buildozer needs at runtime
-# ============================================================
-
 name: Build APK
-
-on:
-  push:
-    branches: [main]
-  workflow_dispatch:
-
+on: [push, workflow_dispatch]
 jobs:
   build:
     runs-on: ubuntu-22.04
-
     steps:
-      # ── 1. Checkout ────────────────────────────────────────────────────────
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      # ── 2. Java 17 (required by Android SDK tools) ────────────────────────
+      - uses: actions/checkout@v4
       - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: 'temurin'
-
-      # ── 3. Python 3.10 ────────────────────────────────────────────────────
-      # Use 3.10 (not 3.11) — p4a's recipe for Python 3 targets 3.10 on
-      # the current stable toolchain. 3.11 requires a newer p4a.
-      - name: Set up Python 3.10
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-
-      # ── 4. System dependencies ────────────────────────────────────────────
-      # These are required by buildozer, Kivy, and the Android SDK tools.
-      # Original script was missing libsqlite3-dev, libpng-dev, libjpeg-dev,
-      # zlib1g-dev, python3-dev — these cause mid-build failures.
       - name: Install system dependencies
         run: |
-          sudo apt-get update -qq
+          sudo apt-get update
           sudo apt-get install -y \
             zip unzip build-essential git \
             libffi-dev libssl-dev autoconf \
-            libtool pkg-config cmake \
-            libsqlite3-dev \
-            libpng-dev libjpeg-dev \
-            zlib1g-dev \
-            python3-dev \
-            ccache
-
-      # ── 5. Python build tools ─────────────────────────────────────────────
-      # Cython 0.29.37: last 0.29.x release that works with Python 3.10.
-      # 0.29.33 (original) fails on Python 3.10+ with SyntaxError.
-      - name: Install Python build tools
+            libtool pkg-config cmake
+      - name: Install Python dependencies
         run: |
-          pip install --upgrade pip wheel
-          pip install "cython==0.29.37" "buildozer==1.5.0" "kivy==2.3.0"
-
-      # ── 6. Cache buildozer downloads ──────────────────────────────────────
-      # SDK + NDK + p4a recipes download ~4 GB on every run without this.
-      # With cache: first run ~45 min, subsequent runs ~8 min.
-      - name: Cache buildozer global directory
-        uses: actions/cache@v4
-        with:
-          path: ~/.buildozer
-          key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
-          restore-keys: |
-            buildozer-${{ runner.os }}-
-
-      # ── 7. Android SDK licence acceptance ────────────────────────────────
-      - name: Accept Android SDK licences
+          pip install --upgrade pip
+          pip install cython==0.29.33 buildozer kivy
+      - name: Create buildozer.spec
+        run: |
+          cat > buildozer.spec << 'SPEC'
+          [app]
+          title = Buddy Guard
+          package.name = buddyguard
+          package.domain = com.parentalcontrol
+          source.dir = .
+          source.include_exts = py,json
+          version = 1.0
+          requirements = python3,kivy,requests,certifi,urllib3,charset-normalizer,idna,android,plyer
+          orientation = portrait
+          android.permissions = CAMERA,RECORD_AUDIO,FOREGROUND_SERVICE,RECEIVE_BOOT_COMPLETED,VIBRATE,POST_NOTIFICATIONS,WRITE_EXTERNAL_STORAGE,READ_EXTERNAL_STORAGE,INTERNET,ACCESS_NETWORK_STATE
+          android.api = 33
+          android.minapi = 26
+          android.ndk = 25b
+          android.accept_sdk_license = True
+          android.archs = arm64-v8a
+          fullscreen = 0
+          log_level = 2
+          [buildozer]
+          log_level = 2
+          warn_on_root = 1
+          SPEC
+      - name: Accept Android licenses
         run: |
           mkdir -p ~/.android
           echo "count=0" > ~/.android/repositories.cfg
-          # Pre-accept all SDK licences (needed for buildozer's SDK download)
-          yes | sdkmanager --licenses 2>/dev/null || true
-
-      # ── 8. Build ──────────────────────────────────────────────────────────
-      # NOTE: We do NOT recreate buildozer.spec here.
-      # The spec in the repo is used as-is. This was the #1 bug in the
-      # original workflow — overwriting spec stripped jnius/android/plyer.
       - name: Build APK
         env:
-          JAVA_HOME: ${{ steps.setup-java.outputs.path }}
-          ANDROID_SDK_ROOT: ${{ env.ANDROID_HOME }}
-        run: |
-          # Verbose buildozer output captured to build.log
-          buildozer -v android debug 2>&1 | tee build.log
-
-      # ── 9. Upload APK artifact ────────────────────────────────────────────
+          JAVA_HOME: ${{ env.JAVA_HOME_17_X64 }}
+        run: buildozer android debug 2>&1 | tee build.log
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: BuddyGuard-APK
           path: bin/*.apk
           if-no-files-found: warn
-          retention-days: 30
-
-      # ── 10. Always upload build log (even on failure) ─────────────────────
       - name: Upload build log
         uses: actions/upload-artifact@v4
         if: always()
         with:
           name: build-log
           path: build.log
-          retention-days: 7
