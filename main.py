@@ -15,6 +15,17 @@ import time
 import threading
 import requests
 
+# ============================================================
+# FIX 1: SSL — point certifi CA bundle before any HTTPS call
+# This must happen before Kivy imports touch the network
+# ============================================================
+try:
+    import certifi
+    os.environ['SSL_CERT_FILE']    = certifi.where()
+    os.environ['REQUESTS_CA_BUNDLE'] = certifi.where()
+except Exception as _ssl_e:
+    print(f"[SSL] certifi setup warning: {_ssl_e}")
+
 # Kivy must be imported before anything else touches the window
 from kivy.app import App
 from kivy.clock import Clock, mainthread
@@ -37,6 +48,32 @@ POLL_SECS  = 30
 STORE_FILE = "buddy_device.json"
 
 # ============================================================
+# FIX 2: SSL session factory
+# All requests go through this — uses certifi bundle explicitly
+# ============================================================
+def make_session() -> requests.Session:
+    s = requests.Session()
+    try:
+        import certifi
+        s.verify = certifi.where()
+    except Exception:
+        s.verify = True   # fall back to default
+    # Retry adapter — 3 retries on connection errors
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
+    retry = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=[500, 502, 503, 504],
+        allowed_methods=["GET", "POST"],
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    s.mount("https://", adapter)
+    s.mount("http://",  adapter)
+    return s
+
+
+# ============================================================
 # ANDROID HELPERS  (no-op on desktop)
 # ============================================================
 if platform == 'android':
@@ -45,23 +82,21 @@ if platform == 'android':
     from jnius import autoclass, PythonJavaClass, java_method
 
     # ── Java classes ──────────────────────────────────────────
-    Context         = autoclass('android.content.Context')
-    DevicePolicyMgr = autoclass('android.app.admin.DevicePolicyManager')
-    PythonActivity  = autoclass('org.kivy.android.PythonActivity')
-    NotifManager    = autoclass('android.app.NotificationManager')
-    NotifBuilder    = autoclass('android.app.Notification$Builder')
-    NotifChannel    = autoclass('android.app.NotificationChannel')
-    String          = autoclass('java.lang.String')
-    MediaRecorder   = autoclass('android.media.MediaRecorder')
-    Camera          = autoclass('android.hardware.Camera')
+    Context        = autoclass('android.content.Context')
+    PythonActivity = autoclass('org.kivy.android.PythonActivity')
+    NotifManager   = autoclass('android.app.NotificationManager')
+    NotifBuilder   = autoclass('android.app.Notification$Builder')
+    NotifChannel   = autoclass('android.app.NotificationChannel')
+    String         = autoclass('java.lang.String')
+    MediaRecorder  = autoclass('android.media.MediaRecorder')
+    Camera         = autoclass('android.hardware.Camera')
 
-    # FIX: Build$VERSION is an inner class — must be autoclassed separately
+    # FIX: Build$VERSION is a Java inner class — autoclass separately
     Build        = autoclass('android.os.Build')
     BuildVersion = autoclass('android.os.Build$VERSION')
 
     # ── Device info ───────────────────────────────────────────
     def get_device_uid() -> str:
-        """Return Android ID as unique device identifier."""
         try:
             Settings = autoclass('android.provider.Settings$Secure')
             ctx = PythonActivity.mActivity.getApplicationContext()
@@ -72,7 +107,6 @@ if platform == 'android':
             return str(uuid.uuid4())
 
     def get_device_info() -> dict:
-        # FIX: use BuildVersion.RELEASE not Build.VERSION.RELEASE
         return {
             'device_name':     str(Build.MODEL),
             'model':           str(Build.MODEL),
@@ -123,7 +157,6 @@ if platform == 'android':
 
             buf = []
 
-            # FIX: PythonJavaClass imported at top level, not inside function
             class JpegCB(PythonJavaClass):
                 __javainterfaces__ = ['android/hardware/Camera$PictureCallback']
                 __javacontext__ = 'app'
@@ -165,7 +198,7 @@ if platform == 'android':
             return None
 
 else:
-    # ── Desktop stubs (for testing on Windows/Mac/Linux) ──────
+    # ── Desktop stubs ─────────────────────────────────────────
     import uuid
 
     def get_device_uid():
@@ -195,7 +228,8 @@ else:
 # ============================================================
 class ApiClient:
     def __init__(self, base_url: str):
-        self.base = base_url.rstrip('/')
+        self.base    = base_url.rstrip('/')
+        self.session = make_session()   # FIX: use SSL-aware session
 
     def _url(self, action: str) -> str:
         return f"{self.base}?action={action}"
@@ -203,24 +237,29 @@ class ApiClient:
     def pair_device(self, key_code, device_uid, info, fcm_token='') -> dict:
         data = {'key_code': key_code, 'device_uid': device_uid,
                 'fcm_token': fcm_token, **info}
-        r = requests.post(self._url('device/pair'), json=data, timeout=15)
+        r = self.session.post(self._url('device/pair'), json=data, timeout=15)
+        r.raise_for_status()
         return r.json()
 
     def heartbeat(self, device_uid: str) -> dict:
-        r = requests.post(self._url('device/heartbeat'),
-                          json={'device_uid': device_uid}, timeout=10)
+        r = self.session.post(self._url('device/heartbeat'),
+                              json={'device_uid': device_uid}, timeout=10)
+        r.raise_for_status()
         return r.json()
 
     def poll_commands(self, device_uid: str) -> list:
-        r = requests.get(self._url('device/poll'),
-                         params={'device_uid': device_uid}, timeout=10)
-        data = r.json()
-        return data.get('commands', [])
+        r = self.session.get(self._url('device/poll'),
+                             params={'device_uid': device_uid}, timeout=10)
+        r.raise_for_status()
+        return r.json().get('commands', [])
 
     def ack_command(self, command_id: int, status: str = 'executed'):
-        requests.post(self._url('device/ack'),
-                      json={'command_id': command_id, 'status': status},
-                      timeout=10)
+        try:
+            self.session.post(self._url('device/ack'),
+                              json={'command_id': command_id, 'status': status},
+                              timeout=10)
+        except Exception as e:
+            print(f"[ACK] Error: {e}")
 
     def upload_media(self, device_uid: str, media_type: str,
                      file_path: str, command_id=None):
@@ -229,8 +268,8 @@ class ApiClient:
             data  = {'device_uid': device_uid, 'media_type': media_type}
             if command_id:
                 data['command_id'] = str(command_id)
-            requests.post(self._url('device/upload'),
-                          files=files, data=data, timeout=30)
+            self.session.post(self._url('device/upload'),
+                              files=files, data=data, timeout=30)
 
     def upload_bytes(self, device_uid: str, media_type: str,
                      file_bytes: bytes, filename: str, command_id=None):
@@ -239,8 +278,8 @@ class ApiClient:
         data  = {'device_uid': device_uid, 'media_type': media_type}
         if command_id:
             data['command_id'] = str(command_id)
-        requests.post(self._url('device/upload'),
-                      files=files, data=data, timeout=30)
+        self.session.post(self._url('device/upload'),
+                          files=files, data=data, timeout=30)
 
 
 api = ApiClient(API_BASE)
@@ -305,7 +344,7 @@ class CommandExecutor:
     def _capture_screenshot(self, cmd_id):
         try:
             path = '/sdcard/buddy_screen.png'
-            app = App.get_running_app()
+            app  = App.get_running_app()
             if app and app.root_window:
                 app.root_window.screenshot(name=path)
             else:
@@ -451,7 +490,7 @@ class KeyEntryScreen(Screen):
                   size=lambda w, v: setattr(w._bg, 'size', v))
 
         title = Label(
-            text="Shield  Buddy Guard",
+            text="Buddy Guard",
             font_size='26sp', bold=True, color=TEXT_WHITE,
             size_hint_y=None, height=50,
         )
@@ -510,10 +549,18 @@ class KeyEntryScreen(Screen):
                 self._goto_home()
             else:
                 self._set_status(resp.get('error', 'Pairing failed.'))
+        except requests.exceptions.SSLError as e:
+            # Specific SSL error — shown clearly so it's easy to diagnose
+            self._set_status(f"SSL Error: {e}")
+            import traceback; traceback.print_exc()
+        except requests.exceptions.ConnectionError as e:
+            self._set_status(f"Connection Error: check your internet")
+            import traceback; traceback.print_exc()
+        except requests.exceptions.Timeout:
+            self._set_status("Timeout: server took too long to respond")
         except Exception as e:
-            import traceback
-            traceback.print_exc()                        # full trace in adb logcat
-            self._set_status(f"{type(e).__name__}: {e}") # type + message on screen
+            import traceback; traceback.print_exc()
+            self._set_status(f"{type(e).__name__}: {e}")
         finally:
             self._reset_btn()
 
@@ -551,17 +598,15 @@ class HomeScreen(Screen):
         )
 
         title = Label(
-            text="Shield  Buddy Guard",
+            text="Buddy Guard",
             font_size='24sp', bold=True, color=TEXT_WHITE,
             size_hint_y=None, height=48,
         )
-
         self.status_lbl = Label(
             text="Connected — monitoring active",
             font_size='13sp', color=SUCCESS,
             size_hint_y=None, height=28,
         )
-
         self.info_lbl = Label(
             text="This device is being managed by your parent.\nAll remote actions are logged.",
             font_size='13sp', color=TEXT_GRAY,
@@ -569,7 +614,6 @@ class HomeScreen(Screen):
             text_size=(Window.width * 0.85, None),
             size_hint_y=None, height=54,
         )
-
         self.uid_lbl = Label(
             text="Device ID: —",
             font_size='11sp', color=TEXT_GRAY,
@@ -581,7 +625,7 @@ class HomeScreen(Screen):
         layout.add_widget(self.status_lbl)
         layout.add_widget(self.info_lbl)
         layout.add_widget(self.uid_lbl)
-        layout.add_widget(KWidget())   # spacer — pushes reset button to bottom
+        layout.add_widget(KWidget())
 
         reset_btn = styled_btn("Reset / Change Key",
                                bg=BG_CARD, fg=TEXT_GRAY, height=44)
@@ -602,8 +646,7 @@ class HomeScreen(Screen):
 
     def on_reset(self, *_):
         try:
-            store = JsonStore(STORE_FILE)
-            store.delete('device')
+            JsonStore(STORE_FILE).delete('device')
         except Exception:
             pass
         app = App.get_running_app()
