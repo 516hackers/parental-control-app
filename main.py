@@ -1,118 +1,86 @@
 # ============================================================
-# PARENTAL CONTROL — Child Device App  (ULTRA-FAST v2)
-# Framework: Kivy (no KivyMD dependency)
+# BUDDY GUARD — main.py  (ULTRA-FAST REAL-TIME v3)
+# Single file Python/Kivy → builds to APK via GitHub Actions
 #
-# ⚡ SPEED UPGRADES vs v1:
-#   1. LONG-POLLING  — server holds connection 20s, returns the INSTANT
-#                      a command is queued → avg <150 ms delivery (was 15s)
-#   2. TCP_NODELAY   — monkey-patches urllib3 globally; disables Nagle's
-#                      algorithm → removes 40-200 ms buffering on every req
-#   3. SO_KEEPALIVE  — detects dropped sockets immediately, no stale waits
-#   4. CONN POOL     — reuses TLS sessions (5 hosts × 10 conns)
-#                      → zero TLS handshake overhead on subsequent requests
-#   5. GZIP          — Accept-Encoding: gzip on every request
-#   6. ThreadPoolExecutor (6 workers) — commands execute in parallel,
-#                      never block the poll loop
-#   7. PRIORITY SORT — lock/unlock commands processed before screenshots
-#   8. DEDUP         — seen-command set; never executes the same cmd twice
-#   9. WAKELOCK      — acquires PARTIAL_WAKE_LOCK so Android never suspends
-#                      the polling thread
-#  10. HeartbeatThread — runs on its own 25 s loop, never touches the
-#                      poll loop timing
-#  11. AUTO-DETECT   — if server returns long-poll req in <0.8 s with no
-#                      cmds, gracefully falls back to 2 s short-poll
-#  12. SESSION WARMUP — establishes TCP+TLS connection at startup so the
-#                      very first poll is instant
-#  13. ACK OFF-THREAD — command ACKs fire-and-forget in daemon threads
-#                      so they never delay the poll loop
-#  14. INSTANT BOOT  — delayed start reduced from 1.5 s → 0.5 s
+# SPEED:  commands delivered avg < 300 ms after parent sends
+# HOW:    True long-poll — server holds connection 20 s,
+#         wakes the INSTANT a command is inserted into DB.
+#         TCP_NODELAY removes buffering. TLS session reused.
+#
+# FIXED in v3 vs v2:
+#   ✔ Camera capture uses thread-safe callback pattern
+#   ✔ Audio recorder releases correctly on error
+#   ✔ Media upload uses multipart/form-data correctly
+#   ✔ SSL fallback: certifi → system CA → no-verify
+#   ✔ Device UID stored locally so it survives app restarts
+#   ✔ Poll loop never blocks on ACK or upload (fire-forget)
+#   ✔ All JNI calls individually try/excepted
+#   ✔ buildozer.spec requirements embedded in comments below
+# ============================================================
+# buildozer.spec requirements:
+#   python3,kivy==2.3.0,requests,certifi,urllib3,
+#   charset-normalizer,idna,android,plyer
+# android.permissions:
+#   CAMERA,RECORD_AUDIO,FOREGROUND_SERVICE,
+#   RECEIVE_BOOT_COMPLETED,VIBRATE,POST_NOTIFICATIONS,
+#   WRITE_EXTERNAL_STORAGE,READ_EXTERNAL_STORAGE,
+#   INTERNET,ACCESS_NETWORK_STATE,WAKE_LOCK
 # ============================================================
 
 from __future__ import annotations
-import os
-import sys
-import time
-import json
-import uuid
-import socket
-import threading
-import traceback
+import os, sys, time, json, uuid, socket, threading, traceback
 from concurrent.futures import ThreadPoolExecutor
 
 # ============================================================
-# STEP 0 — SSL CERTIFICATE SETUP  (must run before any network import)
-# Layer 1: certifi bundle   → most reliable on Android
-# Layer 2: system CA paths  → fallback
-# Layer 3: disable verify   → last resort, logs a warning
+# SSL — must run before ANY network import
 # ============================================================
-def _setup_ssl_env():
+def _setup_ssl():
     try:
         import certifi
-        ca_path = certifi.where()
-        if os.path.exists(ca_path):
-            os.environ['SSL_CERT_FILE']      = ca_path
-            os.environ['REQUESTS_CA_BUNDLE'] = ca_path
-            print(f"[SSL] certifi: {ca_path}")
-            return ca_path
-    except Exception as e:
-        print(f"[SSL] certifi failed: {e}")
-
-    for path in [
-        '/system/etc/security/cacerts',
-        '/etc/ssl/certs/ca-certificates.crt',
-        '/etc/pki/tls/certs/ca-bundle.crt',
-        '/etc/ssl/cert.pem',
-    ]:
-        if os.path.exists(path):
-            os.environ['SSL_CERT_FILE']      = path
-            os.environ['REQUESTS_CA_BUNDLE'] = path
-            print(f"[SSL] system CA: {path}")
-            return path
-
-    print("[SSL] WARNING: no CA bundle — verification disabled.")
+        p = certifi.where()
+        if os.path.exists(p):
+            os.environ['SSL_CERT_FILE']      = p
+            os.environ['REQUESTS_CA_BUNDLE'] = p
+            return p
+    except Exception: pass
+    for p in ['/system/etc/security/cacerts',
+              '/etc/ssl/certs/ca-certificates.crt',
+              '/etc/ssl/cert.pem']:
+        if os.path.exists(p):
+            os.environ['SSL_CERT_FILE']      = p
+            os.environ['REQUESTS_CA_BUNDLE'] = p
+            return p
     return False
 
-SSL_VERIFY = _setup_ssl_env()
-
+SSL_VERIFY = _setup_ssl()
 if SSL_VERIFY is False:
     try:
         import urllib3
-        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-    except Exception:
-        pass
+        urllib3.disable_warnings()
+    except Exception: pass
 
 # ============================================================
-# ⚡ SPEED PATCH — TCP_NODELAY + SO_KEEPALIVE
-# Monkey-patches urllib3's socket factory so EVERY outgoing
-# TCP connection disables Nagle buffering and enables keepalive.
-# Applied globally before any requests import.
+# ⚡ TCP_NODELAY + SO_KEEPALIVE — kills 40-200ms buffering
 # ============================================================
 try:
-    from urllib3.util import connection as _u3conn
-    _orig_create_connection = _u3conn.create_connection
-
-    def _fast_create_connection(address, *args, **kwargs):
-        sock = _orig_create_connection(address, *args, **kwargs)
-        # Disable Nagle — send small packets immediately (saves 40-200 ms)
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        # Keep-alive — detect dropped connections without long timeouts
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        return sock
-
-    _u3conn.create_connection = _fast_create_connection
-    print("[NET] ⚡ TCP_NODELAY + SO_KEEPALIVE applied to all connections")
-except Exception as _tcp_err:
-    print(f"[NET] TCP patch skipped (non-fatal): {_tcp_err}")
+    from urllib3.util import connection as _uc
+    _orig = _uc.create_connection
+    def _fast(address, *a, **kw):
+        s = _orig(address, *a, **kw)
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        s.setsockopt(socket.SOL_SOCKET,  socket.SO_KEEPALIVE, 1)
+        return s
+    _uc.create_connection = _fast
+except Exception: pass
 
 # ============================================================
-# STEP 1 — KIVY WINDOW SETUP
+# KIVY
 # ============================================================
 os.environ.setdefault('KIVY_NO_CONSOLELOG', '0')
-
 from kivy.app import App
 from kivy.clock import Clock, mainthread
 from kivy.core.window import Window
-from kivy.metrics import dp, sp
+from kivy.metrics import dp
 from kivy.uix.screenmanager import ScreenManager, Screen, FadeTransition
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.floatlayout import FloatLayout
@@ -126,314 +94,237 @@ from kivy.utils import platform
 from kivy.storage.jsonstore import JsonStore
 
 # ============================================================
-# CONFIG — ULTRA-FAST CONSTANTS
+# CONFIG
 # ============================================================
-API_BASE          = "https://mirab.ayamilcoders.com/api.php"  # ← Change this
-LONG_POLL_TIMEOUT = 20    # Server holds this many seconds waiting for a command
-                          # → command delivered in avg ~150 ms after parent sends it
-POLL_FALLBACK     = 2     # Short-poll interval if server ignores long-poll param
-POLL_IDLE_SECS    = 15    # Fallback interval after 5 min no commands (battery save)
-HEARTBEAT_SECS    = 25    # Heartbeat cadence (dedicated thread)
-CMD_WORKERS       = 6     # Parallel threads for command execution
-STORE_FILE        = "buddy_device.json"
+API_BASE       = "https://mirab.ayamilcoders.com/api.php"
+LONG_TIMEOUT   = 20      # seconds server holds connection
+HEARTBEAT_SECS = 25
+CMD_WORKERS    = 8
+STORE_FILE     = "buddy_device.json"
+IS_ANDROID     = (platform == 'android')
 
 # ============================================================
-# PLATFORM
+# STORAGE
 # ============================================================
-IS_ANDROID = (platform == 'android')
+def _store() -> JsonStore:
+    return JsonStore(STORE_FILE)
 
-# ============================================================
-# ⚡ FAST SESSION FACTORY
-# - Connection pool: reuse TLS sessions → no handshake overhead
-# - Gzip + keep-alive headers
-# - No adapter-level retries (higher-level code handles that)
-# ============================================================
-def make_fast_session() -> 'requests.Session':
-    import requests
-    from requests.adapters import HTTPAdapter
-
-    s = requests.Session()
-    s.verify = SSL_VERIFY
-    s.headers.update({
-        'Accept-Encoding':  'gzip, deflate',  # Compressed responses
-        'Connection':       'keep-alive',      # Reuse TCP connection
-        'Content-Type':     'application/json',
-        'Cache-Control':    'no-cache',
-        'X-Client-Version': '2.0-fast',
-    })
-    # Pool: 5 distinct hosts, 10 connections per host
-    adapter = HTTPAdapter(pool_connections=5, pool_maxsize=10, max_retries=0)
-    s.mount("https://", adapter)
-    s.mount("http://",  adapter)
-    return s
-
-# ============================================================
-# HELPERS — JSON + STORAGE
-# ============================================================
-def safe_json(response) -> dict | list:
+def store_get(key, field, default=None):
     try:
-        text = response.text.strip()
-        if not text:
-            return {}
-        if text.startswith('<'):
-            print(f"[JSON] Server returned HTML: {text[:120]}")
-            return {}
-        return response.json()
-    except Exception as e:
-        print(f"[JSON] Parse error: {e} | body={response.text[:200]}")
-        return {}
+        s = _store()
+        return s.get(key).get(field, default) if s.exists(key) else default
+    except Exception: return default
 
-def store_get(key: str, field: str, default=None):
-    try:
-        s = JsonStore(STORE_FILE)
-        if s.exists(key):
-            return s.get(key).get(field, default)
-    except Exception as e:
-        print(f"[STORE] get error: {e}")
-    return default
+def store_put(key, **kw):
+    try: _store().put(key, **kw); return True
+    except Exception: return False
 
-def store_put(key: str, **kwargs):
-    try:
-        JsonStore(STORE_FILE).put(key, **kwargs)
-        return True
-    except Exception as e:
-        print(f"[STORE] put error: {e}")
-        return False
+def store_del(key):
+    try: _store().delete(key)
+    except Exception: pass
 
-def store_delete(key: str):
-    try:
-        JsonStore(STORE_FILE).delete(key)
-    except Exception as e:
-        print(f"[STORE] delete error: {e}")
-
-def store_exists(key: str) -> bool:
-    try:
-        return JsonStore(STORE_FILE).exists(key)
-    except Exception:
-        return False
+def store_has(key) -> bool:
+    try: return _store().exists(key)
+    except Exception: return False
 
 # ============================================================
-# ANDROID HELPERS
-# Every import individually wrapped; one failure never kills the chain
+# ANDROID IMPORTS — every one individually wrapped
 # ============================================================
-_android_ok    = False
-PythonActivity = None
-Context        = None
-NotifManager   = None
-NotifBuilder   = None
-NotifChannel   = None
-String_java    = None
-MediaRecorder  = None
-Camera         = None
-Build          = None
-BuildVersion   = None
-SurfaceTexture = None
-PythonJavaClass = None
-java_method    = None
-PowerManager   = None
+_perms_ok = False
+PA = None          # PythonActivity
+_ctx_fn = None     # callable → ApplicationContext
 
 if IS_ANDROID:
     try:
-        from android.permissions import request_permissions, Permission  # type: ignore
-        _android_ok = True
+        from android.permissions import request_permissions, Permission
+        _perms_ok = True
     except Exception as e:
-        print(f"[ANDROID] permissions import failed: {e}")
+        print(f"[ANDROID] permissions: {e}")
 
-    def _try_import(cls_path: str):
+    def _ai(cls):
         try:
-            from jnius import autoclass  # type: ignore
-            return autoclass(cls_path)
+            from jnius import autoclass
+            return autoclass(cls)
         except Exception as e:
-            print(f"[ANDROID] autoclass({cls_path}) failed: {e}")
-            return None
+            print(f"[JNI] {cls}: {e}"); return None
 
-    PythonActivity = _try_import('org.kivy.android.PythonActivity')
-    Context        = _try_import('android.content.Context')
-    NotifManager   = _try_import('android.app.NotificationManager')
-    NotifBuilder   = _try_import('android.app.Notification$Builder')
-    NotifChannel   = _try_import('android.app.NotificationChannel')
-    String_java    = _try_import('java.lang.String')
-    MediaRecorder  = _try_import('android.media.MediaRecorder')
-    Camera         = _try_import('android.hardware.Camera')
-    Build          = _try_import('android.os.Build')
-    BuildVersion   = _try_import('android.os.Build$VERSION')
-    SurfaceTexture = _try_import('android.graphics.SurfaceTexture')
-    PowerManager   = _try_import('android.os.PowerManager')
+    PA              = _ai('org.kivy.android.PythonActivity')
+    _Context        = _ai('android.content.Context')
+    _NotifMgr       = _ai('android.app.NotificationManager')
+    _NotifBuilder   = _ai('android.app.Notification$Builder')
+    _NotifChan      = _ai('android.app.NotificationChannel')
+    _String         = _ai('java.lang.String')
+    _MediaRecorder  = _ai('android.media.MediaRecorder')
+    _Camera         = _ai('android.hardware.Camera')
+    _Build          = _ai('android.os.Build')
+    _BuildVer       = _ai('android.os.Build$VERSION')
+    _SurfaceTex     = _ai('android.graphics.SurfaceTexture')
+    _PowerMgr       = _ai('android.os.PowerManager')
+
+    if PA:
+        def _ctx_fn():
+            return PA.mActivity.getApplicationContext()
 
     try:
-        from jnius import PythonJavaClass, java_method  # type: ignore
-    except Exception as e:
-        print(f"[ANDROID] PythonJavaClass import failed: {e}")
+        from jnius import PythonJavaClass, java_method as _jm
+        _PJC       = PythonJavaClass
+        _java_meth = _jm
+    except Exception:
+        _PJC = _java_meth = None
 
-# ---- WakeLock — keeps CPU running so polling thread never stalls -----------
-_wakelock = None
+else:
+    # Desktop stubs
+    _Context=_NotifMgr=_NotifBuilder=_NotifChan=_String=None
+    _MediaRecorder=_Camera=_Build=_BuildVer=_SurfaceTex=_PowerMgr=None
+    _PJC=_java_meth=None
 
-def acquire_wakelock():
-    """Prevent Android from suspending the polling thread."""
-    global _wakelock
-    if IS_ANDROID and PythonActivity and PowerManager:
+# ============================================================
+# WAKELOCK
+# ============================================================
+_wl = None
+def _acquire_wl():
+    global _wl
+    if IS_ANDROID and PA and _PowerMgr and _ctx_fn:
         try:
-            ctx = PythonActivity.mActivity.getApplicationContext()
-            pm  = ctx.getSystemService(ctx.POWER_SERVICE)
-            wl  = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK,
-                                 "BuddyGuard::FastPoll")
-            wl.acquire()
-            _wakelock = wl
-            print("[WAKELOCK] ⚡ PARTIAL_WAKE_LOCK acquired")
-            return wl
-        except Exception as e:
-            print(f"[WAKELOCK] Failed (non-fatal): {e}")
-    return None
+            ctx = _ctx_fn()
+            pm  = ctx.getSystemService(_ctx_fn().POWER_SERVICE)
+            wl  = pm.newWakeLock(_PowerMgr.PARTIAL_WAKE_LOCK, "BuddyGuard::Poll")
+            wl.acquire(); _wl = wl
+            print("[WL] acquired")
+        except Exception as e: print(f"[WL] {e}")
 
-def release_wakelock():
-    global _wakelock
-    if _wakelock:
-        try:
-            _wakelock.release()
-            print("[WAKELOCK] Released")
-        except Exception:
-            pass
-        _wakelock = None
+def _release_wl():
+    global _wl
+    if _wl:
+        try: _wl.release()
+        except Exception: pass
+        _wl = None
 
-# ---- Device UID -----------------------------------------------------------
-def get_device_uid() -> str:
-    if IS_ANDROID and PythonActivity:
+# ============================================================
+# DEVICE INFO
+# ============================================================
+def get_uid() -> str:
+    if IS_ANDROID and PA:
         try:
-            from jnius import autoclass  # type: ignore
-            Settings = autoclass('android.provider.Settings$Secure')
-            ctx = PythonActivity.mActivity.getApplicationContext()
-            uid = Settings.getString(ctx.getContentResolver(),
-                                     Settings.ANDROID_ID)
-            if uid:
-                return uid
-        except Exception as e:
-            print(f"[UID] Android ID error: {e}")
-    stored = store_get('meta', 'device_uid')
-    if stored:
-        return stored
-    new_uid = str(uuid.uuid4())
-    store_put('meta', device_uid=new_uid)
-    return new_uid
+            from jnius import autoclass
+            S   = autoclass('android.provider.Settings$Secure')
+            ctx = PA.mActivity.getApplicationContext()
+            uid = S.getString(ctx.getContentResolver(), S.ANDROID_ID)
+            if uid: return uid
+        except Exception: pass
+    stored = store_get('meta','uid')
+    if stored: return stored
+    new = str(uuid.uuid4()).replace('-','')[:16]
+    store_put('meta', uid=new); return new
 
-# ---- Device Info ----------------------------------------------------------
-def get_device_info() -> dict:
-    if IS_ANDROID and Build and BuildVersion:
+def get_info() -> dict:
+    if IS_ANDROID and _Build and _BuildVer:
         try:
-            return {
-                'device_name':     str(Build.MODEL),
-                'model':           str(Build.MODEL),
-                'android_version': str(BuildVersion.RELEASE),
-            }
-        except Exception as e:
-            print(f"[INFO] error: {e}")
-    return {'device_name': 'Buddy Device', 'model': 'Android',
-            'android_version': 'Unknown'}
+            return {'device_name': str(_Build.MODEL),
+                    'model':        str(_Build.MODEL),
+                    'android_version': str(_BuildVer.RELEASE)}
+        except Exception: pass
+    return {'device_name':'Buddy Device','model':'Android','android_version':'?'}
 
-# ---- Notifications --------------------------------------------------------
-def android_notify(title: str, message: str):
-    if IS_ANDROID and PythonActivity and Context and NotifManager:
+# ============================================================
+# ANDROID ACTIONS
+# ============================================================
+def do_notify(title: str, msg: str):
+    if IS_ANDROID and PA and _ctx_fn and _NotifMgr and _NotifBuilder:
         try:
-            ctx = PythonActivity.mActivity.getApplicationContext()
-            CHANNEL_ID = "parental_ctrl_v1"
-            nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE)
-            if NotifChannel:
+            ctx = _ctx_fn()
+            CH  = "bg_v3"
+            nm  = ctx.getSystemService(_Context.NOTIFICATION_SERVICE)
+            if _NotifChan:
                 try:
-                    ch = NotifChannel(
-                        CHANNEL_ID,
-                        String_java("Parental Control") if String_java
-                            else "Parental Control",
-                        NotifManager.IMPORTANCE_HIGH,
-                    )
+                    ch = _NotifChan(CH, _String("Buddy Guard") if _String else "Buddy Guard",
+                                    _NotifMgr.IMPORTANCE_HIGH)
                     nm.createNotificationChannel(ch)
-                except Exception:
-                    pass
-            if NotifBuilder:
-                b = NotifBuilder(ctx, CHANNEL_ID)
-                b.setSmallIcon(ctx.getApplicationInfo().icon)
-                if String_java:
-                    b.setContentTitle(String_java(title))
-                    b.setContentText(String_java(message))
-                else:
-                    b.setContentTitle(title)
-                    b.setContentText(message)
-                b.setAutoCancel(True)
-                nm.notify(1001, b.build())
+                except Exception: pass
+            b = _NotifBuilder(ctx, CH)
+            b.setSmallIcon(ctx.getApplicationInfo().icon)
+            if _String:
+                b.setContentTitle(_String(title))
+                b.setContentText(_String(msg))
+            else:
+                b.setContentTitle(title); b.setContentText(msg)
+            b.setAutoCancel(True)
+            nm.notify(9001, b.build())
             return
-        except Exception as e:
-            print(f"[NOTIFY] Error: {e}")
-    print(f"[NOTIFY] {title}: {message}")
+        except Exception as e: print(f"[NOTIFY] {e}")
+    print(f"[NOTIFY] {title}: {msg}")
 
-# ---- Screen Lock ----------------------------------------------------------
-def android_lock_screen(minutes: int = 0):
-    if IS_ANDROID and PythonActivity and Context:
+def do_lock():
+    if IS_ANDROID and PA and _Context:
         try:
-            ctx = PythonActivity.mActivity.getApplicationContext()
-            ctx.getSystemService(Context.DEVICE_POLICY_SERVICE).lockNow()
+            ctx = PA.mActivity.getApplicationContext()
+            ctx.getSystemService(_Context.DEVICE_POLICY_SERVICE).lockNow()
             return
-        except Exception as e:
-            print(f"[LOCK] lockNow error: {e}")
-            try:
-                ctx.getSystemService(Context.KEYGUARD_SERVICE)\
-                   .inKeyguardRestrictedInputMode()
-            except Exception as e2:
-                print(f"[LOCK] Keyguard fallback: {e2}")
-    print(f"[LOCK] lock_screen(minutes={minutes})")
+        except Exception as e: print(f"[LOCK] {e}")
+    print("[LOCK] stub")
 
-# ---- Camera ---------------------------------------------------------------
-def android_take_photo(facing: str = 'back') -> bytes | None:
-    if not IS_ANDROID or not Camera:
-        print(f"[CAMERA] Stub ({facing})")
-        return None
+def do_camera(facing='back') -> bytes | None:
+    """Take a photo. Returns JPEG bytes or None."""
+    if not IS_ANDROID or not _Camera:
+        print(f"[CAM] stub {facing}"); return None
+
     cam_id = 1 if facing == 'front' else 0
     cam = None
+    buf = []
+    evt = threading.Event()
+
     try:
-        for try_id in [cam_id, 1 - cam_id]:
+        # Try preferred cam_id, fallback to other
+        for try_id in ([cam_id, 1 - cam_id]):
             try:
-                cam = Camera.open(try_id)
+                cam = _Camera.open(try_id)
                 break
-            except Exception as e:
-                print(f"[CAMERA] open({try_id}) failed: {e}")
-        if cam is None:
-            return None
-        if SurfaceTexture:
-            cam.setPreviewTexture(SurfaceTexture(0))
+            except Exception: cam = None
+
+        if cam is None: return None
+
+        if _SurfaceTex:
+            try: cam.setPreviewTexture(_SurfaceTex(0))
+            except Exception: pass
+
         cam.startPreview()
-        time.sleep(1.0)   # Reduced: 1.5 s → 1.0 s
-        buf = []
-        if PythonJavaClass and java_method:
-            class JpegCB(PythonJavaClass):  # type: ignore
+        time.sleep(0.8)  # minimal warm-up
+
+        # Build JPEG callback using PythonJavaClass if available
+        if _PJC and _java_meth:
+            class _CB(_PJC):
                 __javainterfaces__ = ['android/hardware/Camera$PictureCallback']
-                __javacontext__ = 'app'
-                @java_method('([BLandroid/hardware/Camera;)V')
+                __javacontext__    = 'app'
+                @_java_meth('([BLandroid/hardware/Camera;)V')
                 def onPictureTaken(self, data, camera):
-                    if data:
-                        buf.append(bytes(data))
-            cam.takePicture(None, None, JpegCB())
-            deadline = time.time() + 4
-            while not buf and time.time() < deadline:
-                time.sleep(0.1)   # Tighter loop: 200 ms → 100 ms
+                    if data: buf.append(bytes(data))
+                    evt.set()
+            cam.takePicture(None, None, _CB())
+        else:
+            evt.set()  # no callback possible
+
+        evt.wait(timeout=5)
         cam.stopPreview()
         cam.release()
         return buf[0] if buf else None
     except Exception as e:
-        print(f"[CAMERA] Error: {e}")
+        print(f"[CAM] error: {e}")
         if cam:
             try: cam.release()
             except Exception: pass
         return None
 
-# ---- Audio ----------------------------------------------------------------
-def android_record_audio(seconds: int = 10) -> str | None:
-    if not IS_ANDROID or not MediaRecorder:
-        print(f"[AUDIO] Stub: {seconds}s")
-        return None
+def do_audio(seconds=15) -> str | None:
+    """Record audio. Returns file path or None."""
+    if not IS_ANDROID or not _MediaRecorder:
+        print(f"[AUD] stub {seconds}s"); return None
     rec = None
     try:
-        path = '/sdcard/buddy_audio.mp4'
-        rec = MediaRecorder()
-        rec.setAudioSource(MediaRecorder.AudioSource.MIC)
-        rec.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-        rec.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+        path = '/sdcard/bg_audio.mp4'
+        rec  = _MediaRecorder()
+        rec.setAudioSource(_MediaRecorder.AudioSource.MIC)
+        rec.setOutputFormat(_MediaRecorder.OutputFormat.MPEG_4)
+        rec.setAudioEncoder(_MediaRecorder.AudioEncoder.AAC)
         rec.setOutputFile(path)
         rec.prepare()
         rec.start()
@@ -442,939 +333,665 @@ def android_record_audio(seconds: int = 10) -> str | None:
         rec.release()
         return path if os.path.exists(path) else None
     except Exception as e:
-        print(f"[AUDIO] Error: {e}")
+        print(f"[AUD] error: {e}")
         if rec:
             try: rec.release()
             except Exception: pass
         return None
 
 # ============================================================
-# ⚡ ULTRA-FAST API CLIENT
-#
-# Key improvements:
-#   poll_commands_long()  — passes ?timeout=N to PHP; server holds
-#                           connection up to N seconds, returns the
-#                           INSTANT a command is inserted into DB.
-#   ack_command()         — fire-and-forget daemon thread; never
-#                           blocks the poll loop.
-#   upload_*()            — all uploads run in daemon threads.
-#   _warmup()             — establishes TCP+TLS at startup.
-#   SSL fallback          — tries verified first, then no-verify;
-#                           result cached in session.verify.
+# ⚡ HTTP SESSION — connection pool + gzip + keep-alive
 # ============================================================
-import requests as _req
+import requests as _rq
 
-class FastApiClient:
-    def __init__(self, base_url: str):
-        self.base    = base_url.rstrip('/')
-        self.session = make_fast_session()
-        self._warmup_done = False
-        self._warmup()
+def _make_session() -> _rq.Session:
+    from requests.adapters import HTTPAdapter
+    s = _rq.Session()
+    s.verify  = SSL_VERIFY
+    s.headers.update({
+        'Accept-Encoding': 'gzip, deflate',
+        'Connection':      'keep-alive',
+        'Content-Type':    'application/json',
+        'Cache-Control':   'no-cache',
+        'X-Client':        'BuddyGuard-v3',
+    })
+    a = HTTPAdapter(pool_connections=3, pool_maxsize=8, max_retries=0)
+    s.mount('https://', a); s.mount('http://', a)
+    return s
+
+# ============================================================
+# API CLIENT
+# ============================================================
+class Api:
+    def __init__(self, base: str):
+        self.base    = base.rstrip('/')
+        self.sess    = _make_session()
+        # Warmup in background
+        threading.Thread(target=self._warmup, daemon=True).start()
 
     def _warmup(self):
-        """Fire-and-forget: open the TCP+TLS connection now so
-        the very first poll doesn't pay handshake overhead."""
-        def _go():
-            try:
-                self.session.get(f"{self.base}?action=ping",
-                                 timeout=5, verify=self.session.verify)
-                self._warmup_done = True
-                print("[NET] ⚡ Connection warmed up")
-            except Exception as e:
-                print(f"[NET] Warmup (non-fatal): {e}")
-        threading.Thread(target=_go, daemon=True).start()
+        try:
+            self.sess.get(f"{self.base}?action=ping", timeout=6)
+            print("[API] warmed up")
+        except Exception: pass
 
-    def _url(self, action: str) -> str:
-        return f"{self.base}?action={action}"
+    def _url(self, action): return f"{self.base}?action={action}"
 
-    def _post(self, action: str, json_data: dict, timeout: int = 8) -> dict:
+    def _post(self, action, data, timeout=10) -> dict:
         url = self._url(action)
-        for verify in list(dict.fromkeys([self.session.verify, False])):
+        for v in list(dict.fromkeys([self.sess.verify, False])):
             try:
-                r = self.session.post(url, json=json_data,
-                                      timeout=timeout, verify=verify)
-                r.raise_for_status()
-                return safe_json(r)
-            except _req.exceptions.SSLError as e:
-                print(f"[API] SSL error verify={verify} → trying no-verify: {e}")
-                continue
-            except (_req.exceptions.ConnectionError,
-                    _req.exceptions.Timeout,
-                    _req.exceptions.HTTPError) as e:
-                print(f"[API] POST {action}: {type(e).__name__}")
-                raise
-            except Exception as e:
-                print(f"[API] POST {action} unexpected: {e}")
-                raise
-        raise RuntimeError("POST: all SSL strategies failed")
+                r = self.sess.post(url, json=data, timeout=timeout, verify=v)
+                return self._parse(r)
+            except _rq.exceptions.SSLError: continue
+            except Exception as e: raise
+        return {}
 
-    def _get(self, action: str, params: dict | None = None,
-             timeout: int = 8) -> dict | list:
+    def _get(self, action, params=None, timeout=10):
         url = self._url(action)
-        for verify in list(dict.fromkeys([self.session.verify, False])):
+        for v in list(dict.fromkeys([self.sess.verify, False])):
             try:
-                r = self.session.get(url, params=params,
-                                     timeout=timeout, verify=verify)
-                r.raise_for_status()
-                return safe_json(r)
-            except _req.exceptions.SSLError as e:
-                print(f"[API] GET SSL error verify={verify} → retrying: {e}")
-                continue
-            except Exception as e:
-                print(f"[API] GET {action}: {type(e).__name__}: {e}")
-                raise
-        raise RuntimeError("GET: all SSL strategies failed")
+                r = self.sess.get(url, params=params, timeout=timeout, verify=v)
+                return self._parse(r)
+            except _rq.exceptions.SSLError: continue
+            except Exception as e: raise
+        return {}
 
-    # ------ ⚡ LONG-POLL (primary speed feature) --------------------------
-    def poll_commands_long(self, device_uid: str,
-                           long_timeout: int = LONG_POLL_TIMEOUT) -> list:
-        """
-        Asks the PHP server to hold this connection for up to `long_timeout`
-        seconds and return immediately when a command is queued.
-
-        Delivery latency:
-          With long-poll  → avg ~150 ms  (server checks every 300 ms)
-          Without (v1)    → avg ~15 s    (30 s polling interval)
-          Improvement     → ~100 ×
-
-        The server needs to support ?timeout=N on device/poll.
-        If it doesn't (returns in < 0.8 s with no commands), the caller
-        detects this and switches to short-poll automatically.
-        """
+    @staticmethod
+    def _parse(r) -> dict:
         try:
-            result = self._get(
-                'device/poll',
-                params={'device_uid': device_uid, 'timeout': long_timeout},
-                timeout=long_timeout + 8,   # Extra buffer beyond server hold
-            )
-            return result.get('commands', []) if isinstance(result, dict) else []
+            t = r.text.strip()
+            if not t: return {}
+            if t.startswith('<'):
+                print(f"[API] HTML response: {t[:80]}")
+                return {}
+            return r.json()
         except Exception as e:
-            print(f"[POLL] long-poll failed: {e}")
-            return []
+            print(f"[API] parse: {e}"); return {}
 
-    # ------ Short-poll fallback -------------------------------------------
-    def poll_commands(self, device_uid: str) -> list:
-        try:
-            result = self._get('device/poll',
-                               params={'device_uid': device_uid}, timeout=5)
-            return result.get('commands', []) if isinstance(result, dict) else []
-        except Exception as e:
-            print(f"[POLL] short-poll failed: {e}")
-            return []
-
-    def heartbeat(self, device_uid: str) -> dict:
-        try:
-            return self._post('device/heartbeat',
-                              {'device_uid': device_uid}, timeout=5)
-        except Exception as e:
-            print(f"[HB] failed: {e}")
-            return {}
-
-    def pair_device(self, key_code: str, device_uid: str,
-                    info: dict, fcm_token: str = '') -> dict:
+    def pair(self, key, uid, info, fcm=''):
         return self._post('device/pair',
-                          {'key_code': key_code, 'device_uid': device_uid,
-                           'fcm_token': fcm_token, **info},
+                          {'key_code':key,'device_uid':uid,'fcm_token':fcm,**info},
                           timeout=20)
 
-    # ⚡ ACK is fire-and-forget so it NEVER delays the poll loop
-    def ack_command(self, command_id: int, status: str = 'executed'):
-        def _ack():
+    def heartbeat(self, uid):
+        try: return self._post('device/heartbeat', {'device_uid':uid}, timeout=6)
+        except Exception: return {}
+
+    def poll_long(self, uid, timeout=LONG_TIMEOUT) -> list:
+        """Long-poll: returns commands within ~300ms of parent sending them."""
+        try:
+            r = self._get('device/poll',
+                          params={'device_uid':uid,'timeout':timeout},
+                          timeout=timeout+10)
+            return r.get('commands',[]) if isinstance(r,dict) else []
+        except Exception as e:
+            print(f"[POLL] {e}"); return []
+
+    def poll_short(self, uid) -> list:
+        try:
+            r = self._get('device/poll', params={'device_uid':uid}, timeout=8)
+            return r.get('commands',[]) if isinstance(r,dict) else []
+        except Exception as e:
+            print(f"[POLL-S] {e}"); return []
+
+    def ack(self, cmd_id, status='executed'):
+        """Fire-and-forget ACK — never blocks poll loop."""
+        def _go():
+            try: self._post('device/ack',{'command_id':cmd_id,'status':status},timeout=6)
+            except Exception: pass
+        threading.Thread(target=_go, daemon=True).start()
+
+    def upload_file(self, uid, media_type, path, cmd_id=None):
+        """Non-blocking file upload."""
+        if not path or not os.path.exists(path): return
+        def _go():
             try:
-                self._post('device/ack',
-                           {'command_id': command_id, 'status': status},
-                           timeout=5)
-            except Exception as e:
-                print(f"[ACK] cmd {command_id} failed: {e}")
-        threading.Thread(target=_ack, daemon=True, name='ack').start()
+                data = {'device_uid':uid,'media_type':media_type}
+                if cmd_id: data['command_id'] = str(cmd_id)
+                with open(path,'rb') as f:
+                    self.sess.post(self._url('device/upload'),
+                                   files={'file':f}, data=data,
+                                   timeout=60, verify=self.sess.verify)
+            except Exception as e: print(f"[UP] {e}")
+        threading.Thread(target=_go, daemon=True).start()
 
-    # ⚡ All uploads are non-blocking
-    def upload_media(self, device_uid: str, media_type: str,
-                     file_path: str, command_id=None):
-        if not file_path or not os.path.exists(file_path):
-            return
-        def _up():
+    def upload_bytes(self, uid, media_type, raw, fname, cmd_id=None):
+        """Non-blocking bytes upload."""
+        def _go():
+            import io
             try:
-                with open(file_path, 'rb') as f:
-                    data = {'device_uid': device_uid, 'media_type': media_type}
-                    if command_id:
-                        data['command_id'] = str(command_id)
-                    self.session.post(self._url('device/upload'),
-                                     files={'file': f}, data=data,
-                                     timeout=30, verify=self.session.verify)
-            except Exception as e:
-                print(f"[UPLOAD] media failed: {e}")
-        threading.Thread(target=_up, daemon=True, name='upload').start()
-
-    def upload_bytes(self, device_uid: str, media_type: str,
-                     file_bytes: bytes, filename: str, command_id=None):
-        def _up():
-            try:
-                import io
-                data = {'device_uid': device_uid, 'media_type': media_type}
-                if command_id:
-                    data['command_id'] = str(command_id)
-                self.session.post(
-                    self._url('device/upload'),
-                    files={'file': (filename, io.BytesIO(file_bytes), 'image/jpeg')},
-                    data=data, timeout=30, verify=self.session.verify,
-                )
-            except Exception as e:
-                print(f"[UPLOAD] bytes failed: {e}")
-        threading.Thread(target=_up, daemon=True, name='upload-b').start()
+                data = {'device_uid':uid,'media_type':media_type}
+                if cmd_id: data['command_id'] = str(cmd_id)
+                self.sess.post(self._url('device/upload'),
+                               files={'file':(fname,io.BytesIO(raw),'image/jpeg')},
+                               data=data, timeout=60, verify=self.sess.verify)
+            except Exception as e: print(f"[UP-B] {e}")
+        threading.Thread(target=_go, daemon=True).start()
 
 
-api = FastApiClient(API_BASE)
+api = Api(API_BASE)
 
 # ============================================================
-# ⚡ COMMAND EXECUTOR — ThreadPool + Priority Sort + Dedup
-#
-# Priority (lower number = executed first):
-#   0  lock_screen / lock_timed   — safety-critical, always first
-#   1  unlock_screen
-#   2  send_notification
-#   3  request_screenshot
-#   4  request_front/back_camera
-#   5  request_audio
-#   6  request_screen_record
-#
-# Dedup: commands are tracked by ID; duplicate deliveries (can
-# happen if network retried the poll) are silently skipped.
+# COMMAND EXECUTOR
+# Priority: lock=0, unlock=1, notify=2, screenshot=3, cam=4, audio=5
+# Dedup: seen set prevents re-executing same cmd_id
 # ============================================================
-_CMD_PRIORITY: dict[str, int] = {
-    'lock_screen':           0,
-    'lock_timed':            0,
-    'unlock_screen':         1,
-    'send_notification':     2,
-    'request_screenshot':    3,
-    'request_front_camera':  4,
-    'request_back_camera':   4,
-    'request_audio':         5,
-    'request_screen_record': 6,
-}
+_PRIO = {'lock_screen':0,'lock_timed':0,'unlock_screen':1,
+         'send_notification':2,'request_screenshot':3,
+         'request_front_camera':4,'request_back_camera':4,
+         'request_audio':5,'request_screen_record':6}
 
-class CommandExecutor:
-    def __init__(self, device_uid: str):
-        self.device_uid = device_uid
-        self._pool      = ThreadPoolExecutor(max_workers=CMD_WORKERS,
-                                            thread_name_prefix='cmd')
-        self._seen: set[int] = set()   # Dedup store
+class Executor:
+    def __init__(self, uid: str):
+        self.uid   = uid
+        self._pool = ThreadPoolExecutor(max_workers=CMD_WORKERS,
+                                        thread_name_prefix='exec')
+        self._seen : set[int] = set()
         self._lock = threading.Lock()
 
-    def submit_batch(self, cmds: list):
-        """Sort by priority → dedup → submit all to thread pool (non-blocking)."""
-        if not cmds:
-            return
-        sorted_cmds = sorted(
-            cmds,
-            key=lambda c: _CMD_PRIORITY.get(c.get('command_type', ''), 99)
-        )
-        for cmd in sorted_cmds:
-            cmd_id = cmd.get('id', 0)
+    def run_batch(self, cmds: list):
+        if not cmds: return
+        cmds = sorted(cmds, key=lambda c: _PRIO.get(c.get('command_type',''),9))
+        for c in cmds:
+            cid = c.get('id',0)
             with self._lock:
-                if cmd_id in self._seen:
-                    print(f"[CMD] Skip duplicate id={cmd_id}")
-                    continue
-                self._seen.add(cmd_id)
-            self._pool.submit(self._safe_execute, cmd)
+                if cid in self._seen: continue
+                self._seen.add(cid)
+            self._pool.submit(self._safe, c)
 
-    def _safe_execute(self, cmd: dict):
-        try:
-            self._execute(cmd)
+    def _safe(self, c):
+        try:   self._run(c)
         except Exception as e:
-            print(f"[CMD] Crash: {e}\n{traceback.format_exc()}")
-            api.ack_command(cmd.get('id', 0), 'failed')
+            print(f"[EXEC] crash: {e}\n{traceback.format_exc()}")
+            api.ack(c.get('id',0),'failed')
 
-    def _execute(self, cmd: dict):
-        ctype   = cmd.get('command_type', '')
-        payload = cmd.get('payload') or {}
-        if isinstance(payload, str):
-            try:   payload = json.loads(payload)
-            except Exception: payload = {}
-        cmd_id = cmd.get('id', 0)
-        print(f"[CMD] ▶ {ctype} | id={cmd_id}")
+    def _run(self, c):
+        t   = c.get('command_type','')
+        p   = c.get('payload') or {}
+        if isinstance(p,str):
+            try: p = json.loads(p)
+            except Exception: p = {}
+        cid = c.get('id',0)
+        print(f"[EXEC] ▶ {t} id={cid}")
 
-        handlers = {
-            'lock_screen':           self._cmd_lock,
-            'lock_timed':            self._cmd_lock_timed,
-            'unlock_screen':         self._cmd_unlock,
-            'send_notification':     self._cmd_notify,
-            'request_screenshot':    self._cmd_screenshot,
-            'request_front_camera':  self._cmd_front_cam,
-            'request_back_camera':   self._cmd_back_cam,
-            'request_audio':         self._cmd_audio,
-            'request_screen_record': self._cmd_screen_record,
-        }
-        h = handlers.get(ctype)
-        if h:
-            h(cmd_id, payload)
+        # ── lock_screen ──────────────────────────────────────
+        if t == 'lock_screen':
+            do_lock()
+            api.ack(cid)
+
+        # ── lock_timed ───────────────────────────────────────
+        elif t == 'lock_timed':
+            mins = int(p.get('minutes',5))
+            do_lock()
+            do_notify("Screen Locked", f"Locked for {mins} min by parent.")
+            api.ack(cid)
+
+        # ── unlock_screen ────────────────────────────────────
+        elif t == 'unlock_screen':
+            do_notify("Screen Unlocked","Your device has been unlocked.")
+            api.ack(cid)
+
+        # ── send_notification ────────────────────────────────
+        elif t == 'send_notification':
+            do_notify(p.get('title','Message'), p.get('message',''))
+            api.ack(cid)
+
+        # ── request_screenshot ───────────────────────────────
+        elif t == 'request_screenshot':
+            self._screenshot(cid)
+
+        # ── request_front_camera ─────────────────────────────
+        elif t == 'request_front_camera':
+            self._camera('front', cid)
+
+        # ── request_back_camera ──────────────────────────────
+        elif t == 'request_back_camera':
+            self._camera('back', cid)
+
+        # ── request_audio ────────────────────────────────────
+        elif t == 'request_audio':
+            secs = int(p.get('seconds',15))
+            self._audio(secs, cid)
+
+        # ── request_screen_record ────────────────────────────
+        elif t == 'request_screen_record':
+            do_notify("Screen Sharing","Parent requested screen view.")
+            api.ack(cid)
+
         else:
-            print(f"[CMD] Unknown type: {ctype}")
-            api.ack_command(cmd_id, 'failed')
+            print(f"[EXEC] unknown: {t}")
+            api.ack(cid,'failed')
 
-    def _cmd_lock(self, cmd_id, _p):
-        android_lock_screen()
-        api.ack_command(cmd_id)
-
-    def _cmd_lock_timed(self, cmd_id, p):
-        minutes = int(p.get('minutes', 5))
-        android_lock_screen(minutes)
-        android_notify("Screen Locked",
-                       f"Device locked for {minutes} minute(s) by parent.")
-        api.ack_command(cmd_id)
-
-    def _cmd_unlock(self, cmd_id, _p):
-        android_notify("Screen Unlocked", "Your device has been unlocked.")
-        api.ack_command(cmd_id)
-
-    def _cmd_notify(self, cmd_id, p):
-        android_notify(p.get('title', 'Message from Parent'),
-                       p.get('message', ''))
-        api.ack_command(cmd_id)
-
-    def _cmd_screenshot(self, cmd_id, _p):
+    def _screenshot(self, cid):
         try:
-            path = '/sdcard/buddy_screen.png'
-            app_ref = App.get_running_app()
-            if app_ref and app_ref.root_window:
-                app_ref.root_window.screenshot(name=path)
-                time.sleep(0.3)   # Reduced: 0.5 → 0.3 s
+            path = '/sdcard/bg_screen.png'
+            app  = App.get_running_app()
+            if app and app.root_window:
+                app.root_window.screenshot(name=path)
+                time.sleep(0.2)
             if os.path.exists(path):
-                api.upload_media(self.device_uid, 'screenshot', path, cmd_id)
-                api.ack_command(cmd_id)
+                api.upload_file(self.uid,'screenshot',path,cid)
+                api.ack(cid)
             else:
-                print("[SCREEN] File not created")
-                api.ack_command(cmd_id, 'failed')
+                api.ack(cid,'failed')
         except Exception as e:
-            print(f"[SCREEN] {e}")
-            api.ack_command(cmd_id, 'failed')
+            print(f"[SS] {e}"); api.ack(cid,'failed')
 
-    def _cmd_front_cam(self, cmd_id, _p):
-        self._capture_camera('front', cmd_id)
-
-    def _cmd_back_cam(self, cmd_id, _p):
-        self._capture_camera('back', cmd_id)
-
-    def _capture_camera(self, facing: str, cmd_id: int):
+    def _camera(self, facing, cid):
         try:
-            data = android_take_photo(facing)
+            data = do_camera(facing)
             if data:
                 fname = f"{facing}_{int(time.time())}.jpg"
-                mtype = 'front_cam' if facing == 'front' else 'back_cam'
-                api.upload_bytes(self.device_uid, mtype, data, fname, cmd_id)
-                api.ack_command(cmd_id)
+                mtype = 'front_cam' if facing=='front' else 'back_cam'
+                api.upload_bytes(self.uid, mtype, data, fname, cid)
+                api.ack(cid)
             else:
-                print(f"[CAMERA] No data for {facing}")
-                api.ack_command(cmd_id, 'failed')
+                api.ack(cid,'failed')
         except Exception as e:
-            print(f"[CAMERA] {e}")
-            api.ack_command(cmd_id, 'failed')
+            print(f"[CAM] {e}"); api.ack(cid,'failed')
 
-    def _cmd_audio(self, cmd_id, p):
-        seconds = int(p.get('seconds', 15))
+    def _audio(self, secs, cid):
         try:
-            path = android_record_audio(seconds)
+            path = do_audio(secs)
             if path and os.path.exists(path):
-                api.upload_media(self.device_uid, 'audio', path, cmd_id)
-                api.ack_command(cmd_id)
+                api.upload_file(self.uid,'audio',path,cid)
+                api.ack(cid)
             else:
-                api.ack_command(cmd_id, 'failed')
+                api.ack(cid,'failed')
         except Exception as e:
-            print(f"[AUDIO] {e}")
-            api.ack_command(cmd_id, 'failed')
-
-    def _cmd_screen_record(self, cmd_id, _p):
-        android_notify("Screen Sharing", "Parent has requested screen view.")
-        api.ack_command(cmd_id)
+            print(f"[AUD] {e}"); api.ack(cid,'failed')
 
     def shutdown(self):
         self._pool.shutdown(wait=False)
 
 
 # ============================================================
-# HEARTBEAT THREAD — lightweight, fully independent of polling
-# Sends a POST every HEARTBEAT_SECS on its own daemon thread so
-# the poll loop is never delayed by heartbeat I/O.
+# HEARTBEAT THREAD (independent, never touches poll)
 # ============================================================
-class HeartbeatThread(threading.Thread):
-    def __init__(self, device_uid: str):
-        super().__init__(daemon=True, name='heartbeat')
-        self.device_uid = device_uid
-        self.running    = True
-
+class HBThread(threading.Thread):
+    def __init__(self, uid):
+        super().__init__(daemon=True, name='hb')
+        self.uid = uid; self._run_flag = True
     def run(self):
-        print(f"[HB] Thread started — interval {HEARTBEAT_SECS}s")
-        while self.running:
-            for _ in range(HEARTBEAT_SECS * 10):   # Check stop in 0.1 s steps
-                if not self.running:
-                    return
+        while self._run_flag:
+            for _ in range(HEARTBEAT_SECS*10):
+                if not self._run_flag: return
                 time.sleep(0.1)
-            try:
-                api.heartbeat(self.device_uid)
-            except Exception as e:
-                print(f"[HB] Error: {e}")
-
-    def stop(self):
-        self.running = False
+            try: api.heartbeat(self.uid)
+            except Exception: pass
+    def stop(self): self._run_flag = False
 
 
 # ============================================================
-# ⚡ ULTRA-FAST ADAPTIVE POLLER
+# ⚡ ULTRA-FAST POLLER
 #
-# HOW IT WORKS:
-#
-#   LONG-POLL MODE (default):
-#     1. Send GET /api.php?action=device/poll&device_uid=X&timeout=20
-#     2. PHP server blocks up to 20 s, checking every 300 ms for cmds
-#     3. When parent queues a command, PHP returns it within ~300 ms
-#     4. Client processes commands, immediately sends next long-poll
-#     → No sleep between cycles — the server's wait IS the sleep
-#     → Commands arrive avg 150 ms after parent sends (was avg 15 s)
-#
-#   SHORT-POLL FALLBACK (if server returns in < 0.8 s with no cmds):
-#     Server ignored the timeout param → fall back to 2 s interval
-#     After 5 min idle → stretch to 15 s to save battery
-#
-#   AUTO-RESTART:
-#     Any unhandled exception → exponential backoff (max 30 s) → retry
+# Cycle:
+#   1. Long-poll GET ?timeout=20
+#      → server holds 20s, returns the INSTANT cmd inserted
+#      → avg delivery: ~300ms
+#   2. If server returns in <0.6s with nothing (3 times):
+#      switches to 2s short-poll (server doesn't support LP)
+#   3. After 5min no commands: stretches to 5s (battery save)
+#   4. Any exception: exponential backoff up to 30s, then retry
 # ============================================================
-class UltraFastPoller(threading.Thread):
-    def __init__(self, device_uid: str, app_ref):
-        super().__init__(daemon=True, name='ultra-poller')
-        self.device_uid          = device_uid
-        self.app                 = app_ref
-        self.running             = True
-        self.executor            = CommandExecutor(device_uid)
-        self._consecutive_errors = 0
-        self._max_backoff        = 30        # seconds
-        self._long_poll_works    = True      # optimistic assumption
-        self._fast_misses        = 0         # track consecutive fast empty returns
-        self._last_cmd_time      = 0.0       # for idle detection
-        self._total_cmds         = 0
-        self._cycles             = 0
+class Poller(threading.Thread):
+    def __init__(self, uid, app_ref):
+        super().__init__(daemon=True, name='poller')
+        self.uid          = uid
+        self.app          = app_ref
+        self._stop_flag   = False
+        self.executor     = Executor(uid)
+        self._errors      = 0
+        self._lp          = True     # long-poll mode?
+        self._fast_misses = 0
+        self._last_cmd    = 0.0
+        self._total       = 0
 
     def run(self):
-        print(f"[POLLER] ⚡ Ultra-fast poller started | uid={self.device_uid}")
-        acquire_wakelock()
-
-        while self.running:
+        _acquire_wl()
+        print(f"[POLL] started uid={self.uid}")
+        self._set_status("⚡ Connecting…", (1,.78,.2,1))
+        while not self._stop_flag:
             try:
                 self._cycle()
-                self._consecutive_errors = 0
-            except Exception as err:
-                self._consecutive_errors += 1
-                backoff = min(2 ** self._consecutive_errors, self._max_backoff)
-                print(f"[POLLER] Error #{self._consecutive_errors}: {err} "
-                      f"— backoff {backoff}s")
-                self._update_status(f"Reconnecting ({backoff}s)…", WARN_COL)
-                self._sleep(backoff)
+                self._errors = 0
+            except Exception as e:
+                self._errors += 1
+                wait = min(2**self._errors, 30)
+                print(f"[POLL] err #{self._errors}: {e} — wait {wait}s")
+                self._set_status(f"Reconnecting…", (1,.78,.2,1))
+                self._sleep(wait)
 
     def _cycle(self):
-        self._cycles += 1
-        now       = time.time()
-        idle_secs = now - self._last_cmd_time if self._last_cmd_time > 0 else 9999
-        cmds: list = []
-
-        if self._long_poll_works:
-            # ── Long-poll mode ─────────────────────────────────────────────
-            t0    = time.time()
-            cmds  = api.poll_commands_long(self.device_uid,
-                                           long_timeout=LONG_POLL_TIMEOUT)
-            elapsed = time.time() - t0
-
-            if not cmds and elapsed < 0.8:
-                # Server returned suspiciously fast with nothing →
-                # it probably doesn't support long-poll
+        if self._lp:
+            t0   = time.time()
+            cmds = api.poll_long(self.uid, LONG_TIMEOUT)
+            dt   = time.time() - t0
+            if not cmds and dt < 0.6:
                 self._fast_misses += 1
-                if self._fast_misses >= 3:   # 3 strikes before switching
-                    self._long_poll_works = False
-                    self._fast_misses     = 0
-                    print("[POLLER] Long-poll not supported — switching to short-poll")
-                    self._update_mode(False)
+                if self._fast_misses >= 3:
+                    self._lp = False
+                    print("[POLL] LP not supported → short-poll")
+                    self._set_mode(False)
             else:
                 self._fast_misses = 0
-            # No extra sleep in long-poll mode: the server's hold WAS the wait
-
         else:
-            # ── Short-poll fallback ─────────────────────────────────────────
-            cmds     = api.poll_commands(self.device_uid)
-            interval = POLL_IDLE_SECS if idle_secs > 300 else POLL_FALLBACK
-            self._sleep(interval)
+            idle = time.time() - self._last_cmd if self._last_cmd else 9999
+            cmds = api.poll_short(self.uid)
+            self._sleep(5 if idle > 300 else 2)
 
-        self._process_commands(cmds)
+        if cmds:
+            self._last_cmd  = time.time()
+            self._total    += len(cmds)
+            print(f"[POLL] ▼ {len(cmds)} cmd(s) total={self._total}")
+            self.executor.run_batch(cmds)
+            self._set_status(f"⚡ Active — {self._total} cmd(s)", (.25,.80,.55,1))
 
-    def _process_commands(self, cmds: list):
-        if not cmds:
-            return
-        self._last_cmd_time  = time.time()
-        self._total_cmds    += len(cmds)
-        print(f"[POLLER] ▼ {len(cmds)} cmd(s) received | total={self._total_cmds}")
-        self.executor.submit_batch(cmds)
-        self._update_status(
-            f"⚡ Active — {self._total_cmds} command(s) total",
-            SUCCESS
-        )
-
-    def _sleep(self, seconds: float):
-        """Interruptible sleep: wakes on stop() within 0.1 s."""
-        deadline = time.time() + seconds
-        while self.running and time.time() < deadline:
+    def _sleep(self, s):
+        d = time.time() + s
+        while not self._stop_flag and time.time() < d:
             time.sleep(0.1)
 
     @mainthread
-    def _update_status(self, text: str, color):
-        try:
-            App.get_running_app().sm.get_screen('home').set_status(text, color)
-        except Exception:
-            pass
+    def _set_status(self, text, color):
+        try: App.get_running_app().sm.get_screen('home').set_status(text, color)
+        except Exception: pass
 
     @mainthread
-    def _update_mode(self, long_poll: bool):
-        try:
-            App.get_running_app().sm.get_screen('home').set_poll_mode(long_poll)
-        except Exception:
-            pass
+    def _set_mode(self, lp):
+        try: App.get_running_app().sm.get_screen('home').set_mode(lp)
+        except Exception: pass
 
     def stop(self):
-        self.running = False
-        try:
-            self.executor.shutdown()
-        except Exception:
-            pass
-        release_wakelock()
+        self._stop_flag = True
+        self.executor.shutdown()
+        _release_wl()
 
 
 # ============================================================
-# DESIGN TOKENS
+# DESIGN
 # ============================================================
-BG_DARK    = (0.06, 0.06, 0.10, 1)
-BG_CARD    = (0.11, 0.11, 0.18, 1)
-BG_INPUT   = (0.14, 0.14, 0.22, 1)
-ACCENT     = (0.30, 0.57, 1.00, 1)
-ACCENT_DIM = (0.20, 0.40, 0.80, 1)
-TEXT_WHITE = (1.00, 1.00, 1.00, 1)
-TEXT_GRAY  = (0.55, 0.58, 0.65, 1)
-SUCCESS    = (0.25, 0.80, 0.55, 1)
-ERROR_COL  = (1.00, 0.36, 0.36, 1)
-WARN_COL   = (1.00, 0.78, 0.20, 1)
-LIVE_GREEN = (0.20, 0.95, 0.50, 1)
+DARK  = (.06,.06,.10,1)
+CARD  = (.11,.11,.18,1)
+INP   = (.14,.14,.22,1)
+ACC   = (.30,.57,1.0,1)
+WHITE = (1,1,1,1)
+GRAY  = (.55,.58,.65,1)
+GREEN = (.25,.80,.55,1)
+RED   = (1.0,.36,.36,1)
+WARN  = (1.0,.78,.20,1)
+LIVE  = (.20,.95,.50,1)
 
-def _draw_rect_bg(widget, color):
-    with widget.canvas.before:
-        Color(*color)
-        widget._bg_rect = Rectangle(pos=widget.pos, size=widget.size)
-    widget.bind(
-        pos  = lambda w, v: setattr(w._bg_rect, 'pos', v),
-        size = lambda w, v: setattr(w._bg_rect, 'size', v),
-    )
+def _rect_bg(w,c):
+    with w.canvas.before:
+        Color(*c); w._br=Rectangle(pos=w.pos,size=w.size)
+    w.bind(pos=lambda s,v:setattr(s._br,'pos',v),
+           size=lambda s,v:setattr(s._br,'size',v))
 
-def _draw_rounded_bg(widget, color, radius=16):
-    with widget.canvas.before:
-        Color(*color)
-        widget._bg_rr = RoundedRectangle(
-            pos=widget.pos, size=widget.size, radius=[dp(radius)])
-    widget.bind(
-        pos  = lambda w, v: setattr(w._bg_rr, 'pos', v),
-        size = lambda w, v: setattr(w._bg_rr, 'size', v),
-    )
+def _rnd_bg(w,c,r=16):
+    with w.canvas.before:
+        Color(*c); w._rr=RoundedRectangle(pos=w.pos,size=w.size,radius=[dp(r)])
+    w.bind(pos=lambda s,v:setattr(s._rr,'pos',v),
+           size=lambda s,v:setattr(s._rr,'size',v))
 
-def make_btn(text: str, bg=ACCENT, fg=TEXT_WHITE,
-             height_dp: int = 52, radius: int = 14,
-             font_size: str = '16sp') -> Button:
-    btn = Button(
-        text=text, size_hint=(1, None), height=dp(height_dp),
-        background_normal='', background_color=(0, 0, 0, 0),
-        color=fg, font_size=font_size, bold=True,
-    )
-    _draw_rounded_bg(btn, bg, radius)
-    return btn
+def _btn(text,bg=None,fg=WHITE,h=52,r=14,fs='16sp'):
+    if bg is None: bg=ACC
+    b=Button(text=text,size_hint=(1,None),height=dp(h),
+             background_normal='',background_color=(0,0,0,0),
+             color=fg,font_size=fs,bold=True)
+    _rnd_bg(b,bg,r); return b
 
-def make_input(hint: str, password: bool = False,
-               font_size: str = '15sp') -> TextInput:
-    return TextInput(
-        hint_text=hint, multiline=False, password=password,
-        size_hint=(1, None), height=dp(50),
-        background_color=BG_INPUT, foreground_color=TEXT_WHITE,
-        hint_text_color=TEXT_GRAY, cursor_color=ACCENT,
-        padding=[dp(14), dp(12)], font_size=font_size,
-    )
+def _inp(hint,pw=False):
+    return TextInput(hint_text=hint,multiline=False,password=pw,
+                     size_hint=(1,None),height=dp(50),
+                     background_color=INP,foreground_color=WHITE,
+                     hint_text_color=GRAY,cursor_color=ACC,
+                     padding=[dp(14),dp(12)],font_size='15sp')
 
-def make_status_label() -> Label:
-    return Label(
-        text='', font_size='13sp', color=ERROR_COL,
-        size_hint=(1, None), height=dp(30),
-        halign='center', valign='middle',
-    )
+def _lbl(text,fs,color,h,align='center',bold=False):
+    l=Label(text=text,font_size=fs,color=color,bold=bold,
+            size_hint=(1,None),height=dp(h),halign=align,valign='middle')
+    l.bind(size=l.setter('text_size')); return l
 
 
 # ============================================================
-# SCREEN: KEY ENTRY
+# KEY ENTRY SCREEN
 # ============================================================
-class KeyEntryScreen(Screen):
-    def __init__(self, **kw):
+class KeyScreen(Screen):
+    def __init__(self,**kw):
         super().__init__(**kw)
-        self._build_ui()
-        Window.bind(on_resize=self._on_resize)
+        self._build()
+        Window.bind(on_resize=lambda *_: Clock.schedule_once(lambda dt:self._build(),.05))
 
-    def _build_ui(self):
+    def _build(self):
         self.clear_widgets()
-        root = FloatLayout()
-        _draw_rect_bg(root, BG_DARK)
-        sv = ScrollView(size_hint=(1, 1), do_scroll_x=False)
-        inner = BoxLayout(
-            orientation='vertical', spacing=dp(14),
-            padding=[dp(24), dp(48), dp(24), dp(24)],
-            size_hint_y=None,
-        )
+        root=FloatLayout(); _rect_bg(root,DARK)
+        sv=ScrollView(size_hint=(1,1),do_scroll_x=False)
+        inner=BoxLayout(orientation='vertical',spacing=dp(12),
+                        padding=[dp(20),dp(44),dp(20),dp(20)],size_hint_y=None)
         inner.bind(minimum_height=inner.setter('height'))
-        card = BoxLayout(
-            orientation='vertical', spacing=dp(14),
-            padding=[dp(24), dp(28), dp(24), dp(28)],
-            size_hint=(1, None),
-        )
-        _draw_rounded_bg(card, BG_CARD, radius=20)
+        card=BoxLayout(orientation='vertical',spacing=dp(12),
+                       padding=[dp(22),dp(26),dp(22),dp(26)],size_hint=(1,None))
+        _rnd_bg(card,CARD,20)
 
-        # Logo
-        logo_wrap = BoxLayout(size_hint=(1, None), height=dp(70))
-        logo_wrap.add_widget(Label(text="🛡️", font_size='48sp', size_hint=(1,1)))
+        card.add_widget(_lbl("🛡️",'48sp',WHITE,64))
+        card.add_widget(_lbl("Buddy Guard",'26sp',WHITE,40,bold=True))
+        card.add_widget(_lbl("Parental Control — Child Device",'13sp',GRAY,24))
+        card.add_widget(_lbl("⚡ Real-Time • Long-Poll • <300 ms",'12sp',LIVE,22))
+        sep=Widget(size_hint=(1,None),height=dp(1)); _rect_bg(sep,(.2,.2,.3,1))
+        card.add_widget(sep)
+        card.add_widget(_lbl("Enter the key your parent gave you:",'13sp',GRAY,22,'left'))
 
-        def _lbl(text, size, color, height, halign='center', bold=False):
-            l = Label(text=text, font_size=size, color=color, bold=bold,
-                      size_hint=(1, None), height=dp(height), halign=halign)
-            l.bind(size=l.setter('text_size'))
-            return l
+        self.key_in  = _inp("ABCD-1234-WXYZ-5678")
+        self.st_lbl  = Label(text='',font_size='13sp',color=RED,
+                             size_hint=(1,None),height=dp(26),halign='center')
+        self.st_lbl.bind(size=self.st_lbl.setter('text_size'))
+        self.btn = _btn("Apply Key & Pair Device")
+        self.btn.bind(on_press=self._apply)
 
-        title       = _lbl("Buddy Guard",           '26sp', TEXT_WHITE, 40, bold=True)
-        subtitle    = _lbl("Parental Control — Child Setup", '13sp', TEXT_GRAY, 24)
-        speed_badge = _lbl("⚡ Ultra-Fast • Long-Poll • ~150 ms delivery",
-                           '12sp', LIVE_GREEN, 22)
-        desc        = _lbl("Ask your parent for your device key\n"
-                           "and enter it below to get started.",
-                           '13sp', TEXT_GRAY, 48)
-
-        div = Widget(size_hint=(1, None), height=dp(1))
-        _draw_rect_bg(div, TEXT_GRAY)
-
-        key_label = _lbl("Device Key", '13sp', TEXT_GRAY, 20, halign='left')
-
-        self.key_input  = make_input("ABCD-1234-WXYZ-5678")
-        self.status_lbl = make_status_label()
-        self.apply_btn  = make_btn("Apply Key & Pair Device")
-        self.apply_btn.bind(on_press=self.on_apply)
-
-        for w in [logo_wrap, title, subtitle, speed_badge, desc, div,
-                  key_label, self.key_input, self.status_lbl, self.apply_btn]:
+        for w in [self.key_in, self.st_lbl, self.btn]:
             card.add_widget(w)
-        card.height = (
-            sum(w.height for w in card.children if hasattr(w, 'height'))
-            + dp(14) * (len(card.children) - 1) + dp(56)
-        )
+        card.height = sum(getattr(c,'height',0) for c in card.children) + dp(12)*(len(card.children)-1)+dp(52)
         inner.add_widget(card)
-        sv.add_widget(inner)
-        root.add_widget(sv)
-        self.add_widget(root)
+        sv.add_widget(inner); root.add_widget(sv); self.add_widget(root)
 
-    def _on_resize(self, *_):
-        Clock.schedule_once(lambda dt: self._build_ui(), 0.05)
+    def _apply(self,*_):
+        key = self.key_in.text.strip().upper()
+        if len(key.replace('-','').replace(' ','')) < 8:
+            self._status("Enter a valid key (at least 8 characters)."); return
+        self.btn.text = "Connecting…"; self.btn.disabled=True; self._status('')
+        threading.Thread(target=self._pair,args=(key,),daemon=True).start()
 
-    def on_apply(self, *_):
-        key = self.key_input.text.strip().upper()
-        if len(key.replace('-', '').replace(' ', '')) < 8:
-            self._set_status("Please enter a valid key (min 8 characters).")
-            return
-        self.apply_btn.text     = "Connecting…"
-        self.apply_btn.disabled = True
-        self._set_status("")
-        threading.Thread(target=self._do_pair, args=(key,), daemon=True).start()
-
-    def _do_pair(self, key: str):
-        uid = get_device_uid()
-        info = get_device_info()
-        last_err = ""
-        for attempt in range(1, 4):
+    def _pair(self, key):
+        uid  = get_uid()
+        info = get_info()
+        err  = ''
+        for attempt in range(1,4):
             try:
-                resp = api.pair_device(key, uid, info)
-                if resp.get('success'):
-                    store_put('device', key_code=key, device_uid=uid,
-                              device_id=resp.get('device_id', 0), paired=True)
-                    self._set_status("")
-                    self._goto_home()
-                    return
+                r = api.pair(key,uid,info)
+                if r.get('success'):
+                    store_put('device',key=key,uid=uid,
+                              dev_id=r.get('device_id',0),paired=True)
+                    self._status(''); self._go_home(); return
                 else:
-                    self._set_status(resp.get('error', resp.get('message',
-                                                                 'Pairing failed.')))
-                    return
-            except _req.exceptions.SSLError:
-                last_err = f"SSL Error (attempt {attempt}/3)"
-            except _req.exceptions.ConnectionError:
-                last_err = f"No connection (attempt {attempt}/3)"
-            except _req.exceptions.Timeout:
-                last_err = f"Timeout (attempt {attempt}/3)"
+                    self._status(r.get('error','Pairing failed.')); break
+            except _rq.exceptions.SSLError:
+                err=f"SSL error (attempt {attempt}/3)"
+            except _rq.exceptions.ConnectionError:
+                err=f"No connection (attempt {attempt}/3)"
+            except _rq.exceptions.Timeout:
+                err=f"Timeout (attempt {attempt}/3)"
             except Exception as e:
-                last_err = f"{type(e).__name__}: {str(e)[:80]}"
-                traceback.print_exc()
+                err=str(e)[:80]; traceback.print_exc()
             if attempt < 3:
-                self._set_status(f"{last_err}. Retrying…")
-                time.sleep(2 ** attempt)
-        self._set_status(last_err)
+                self._status(f"{err} — retrying…"); time.sleep(2**attempt)
+        self._status(err or 'Failed')
         self._reset_btn()
 
     @mainthread
-    def _set_status(self, msg: str, success: bool = False):
-        try:
-            self.status_lbl.color = SUCCESS if success else ERROR_COL
-            self.status_lbl.text  = msg
+    def _status(self,msg,ok=False):
+        try: self.st_lbl.color=GREEN if ok else RED; self.st_lbl.text=msg
         except Exception: pass
 
     @mainthread
     def _reset_btn(self):
-        try:
-            self.apply_btn.text     = "Apply Key & Pair Device"
-            self.apply_btn.disabled = False
+        try: self.btn.text="Apply Key & Pair Device"; self.btn.disabled=False
         except Exception: pass
 
     @mainthread
-    def _goto_home(self):
-        try:
-            app = App.get_running_app()
-            app.sm.transition = FadeTransition()
-            app.sm.current    = 'home'
-            app.start_polling()
-        except Exception as e:
-            print(f"[UI] _goto_home error: {e}")
+    def _go_home(self):
+        app=App.get_running_app()
+        app.sm.transition=FadeTransition()
+        app.sm.current='home'
+        app.start_polling()
 
 
 # ============================================================
-# SCREEN: HOME — live pulse indicator + poll-mode display
+# HOME SCREEN
 # ============================================================
 class HomeScreen(Screen):
-    def __init__(self, **kw):
+    def __init__(self,**kw):
         super().__init__(**kw)
-        self._pulse_event = None
-        self._pulse_state = True
-        self._build_ui()
-        Window.bind(on_resize=self._on_resize)
+        self._pulse_ev=None; self._pulse_st=True
+        self._build()
+        Window.bind(on_resize=lambda *_: Clock.schedule_once(lambda dt:self._build(),.05))
 
-    def _build_ui(self):
+    def _build(self):
         self.clear_widgets()
-        root = FloatLayout()
-        _draw_rect_bg(root, BG_DARK)
+        root=FloatLayout(); _rect_bg(root,DARK)
+        layout=BoxLayout(orientation='vertical',spacing=dp(14),
+                         padding=[dp(22),dp(44),dp(22),dp(22)],size_hint=(1,1))
 
-        layout = BoxLayout(
-            orientation='vertical', spacing=dp(16),
-            padding=[dp(24), dp(48), dp(24), dp(24)],
-            size_hint=(1, 1),
-        )
+        # Header
+        hdr=BoxLayout(orientation='vertical',spacing=dp(4),size_hint=(1,None),height=dp(80))
+        hdr.add_widget(_lbl("🛡️  Buddy Guard",'26sp',WHITE,48,bold=True))
+        self.st_lbl=Label(text="Connecting…",font_size='13sp',color=WARN,
+                          size_hint=(1,None),height=dp(24),halign='center')
+        self.st_lbl.bind(size=self.st_lbl.setter('text_size'))
+        hdr.add_widget(self.st_lbl)
 
-        # ── Header ──
-        header = BoxLayout(orientation='vertical', spacing=dp(6),
-                           size_hint=(1, None), height=dp(90))
-        title = Label(text="🛡️  Buddy Guard", font_size='26sp', bold=True,
-                      color=TEXT_WHITE, size_hint=(1, None), height=dp(48),
-                      halign='center')
-        title.bind(size=title.setter('text_size'))
-        self.status_lbl = Label(text="Connecting…", font_size='13sp',
-                                color=WARN_COL, size_hint=(1, None),
-                                height=dp(24), halign='center')
-        self.status_lbl.bind(size=self.status_lbl.setter('text_size'))
-        header.add_widget(title)
-        header.add_widget(self.status_lbl)
+        # Status card
+        sc=BoxLayout(orientation='vertical',spacing=dp(6),
+                     padding=[dp(16),dp(14),dp(16),dp(14)],
+                     size_hint=(1,None),height=dp(160))
+        _rnd_bg(sc,CARD,18)
 
-        # ── Live status card ──
-        status_card = BoxLayout(
-            orientation='vertical', spacing=dp(8),
-            padding=[dp(18), dp(16), dp(18), dp(16)],
-            size_hint=(1, None), height=dp(168),
-        )
-        _draw_rounded_bg(status_card, BG_CARD, radius=18)
-
-        # Row: title + pulsing LIVE dot
-        top_row = BoxLayout(orientation='horizontal',
-                            size_hint=(1, None), height=dp(28))
-        card_title = Label(text="Live Monitoring", font_size='14sp', bold=True,
-                           color=TEXT_WHITE, size_hint=(0.65, 1), halign='left')
-        card_title.bind(size=card_title.setter('text_size'))
-        self.live_dot = Label(text="● LIVE", font_size='12sp', color=LIVE_GREEN,
-                              size_hint=(0.35, 1), halign='right')
+        top=BoxLayout(orientation='horizontal',size_hint=(1,None),height=dp(26))
+        ct=Label(text="Live Monitoring",font_size='14sp',bold=True,
+                 color=WHITE,size_hint=(.65,1),halign='left')
+        ct.bind(size=ct.setter('text_size'))
+        self.live_dot=Label(text="● LIVE",font_size='12sp',color=LIVE,
+                            size_hint=(.35,1),halign='right')
         self.live_dot.bind(size=self.live_dot.setter('text_size'))
-        top_row.add_widget(card_title)
-        top_row.add_widget(self.live_dot)
+        top.add_widget(ct); top.add_widget(self.live_dot)
 
-        self.uid_lbl = Label(text="Device ID: loading…", font_size='11sp',
-                             color=TEXT_GRAY, size_hint=(1, None), height=dp(20),
-                             halign='left')
-        self.uid_lbl.bind(size=self.uid_lbl.setter('text_size'))
+        self.uid_lbl=_lbl("Device ID: —",'11sp',GRAY,18,'left')
+        self.mode_lbl=_lbl("Mode: ⚡ Long-Poll (~300ms)",'11sp',ACC,18,'left')
+        self.info_lbl=_lbl("Device monitored by parent.\nAll actions are securely logged.",
+                           '12sp',GRAY,40,'left')
 
-        # Poll-mode indicator — updates when poller auto-detects server capability
-        self.mode_lbl = Label(
-            text="Mode: ⚡ Long-Poll  (~150 ms delivery)",
-            font_size='11sp', color=ACCENT,
-            size_hint=(1, None), height=dp(20), halign='left',
-        )
-        self.mode_lbl.bind(size=self.mode_lbl.setter('text_size'))
+        for w in [top,self.uid_lbl,self.mode_lbl,self.info_lbl]: sc.add_widget(w)
 
-        self.info_lbl = Label(
-            text="This device is monitored by your parent.\n"
-                 "All remote actions are securely logged.",
-            font_size='12sp', color=TEXT_GRAY,
-            halign='left', valign='top',
-            size_hint=(1, None), height=dp(40),
-        )
-        self.info_lbl.bind(size=self.info_lbl.setter('text_size'))
+        spacer=Widget(size_hint=(1,1))
+        reset=_btn("Reset / Change Key",bg=CARD,fg=GRAY,h=44,r=12,fs='14sp')
+        reset.bind(on_press=self._reset)
+        ver=_lbl("Buddy Guard v3.0 • Ultra-Fast Real-Time",'11sp',GRAY,18)
 
-        for w in [top_row, self.uid_lbl, self.mode_lbl, self.info_lbl]:
-            status_card.add_widget(w)
-
-        spacer = Widget(size_hint=(1, 1))
-
-        reset_btn = make_btn("Reset / Change Key", bg=BG_CARD, fg=TEXT_GRAY,
-                             height_dp=46, radius=12, font_size='14sp')
-        reset_btn.bind(on_press=self.on_reset)
-
-        version_lbl = Label(text="Buddy Guard v2.0  •  Ultra-Fast Edition",
-                            font_size='11sp', color=TEXT_GRAY,
-                            size_hint=(1, None), height=dp(20), halign='center')
-
-        for w in [header, status_card, spacer, reset_btn, version_lbl]:
-            layout.add_widget(w)
-
-        root.add_widget(layout)
-        self.add_widget(root)
-
-    def _on_resize(self, *_):
-        Clock.schedule_once(lambda dt: self._build_ui(), 0.05)
+        for w in [hdr,sc,spacer,reset,ver]: layout.add_widget(w)
+        root.add_widget(layout); self.add_widget(root)
 
     def on_enter(self):
-        uid = store_get('device', 'device_uid', '—')
-        try: self.uid_lbl.text = f"Device ID: {uid}"
+        uid=store_get('device','uid','—')
+        try: self.uid_lbl.text=f"Device ID: {uid}"
         except Exception: pass
         self._start_pulse()
 
-    def on_leave(self):
-        self._stop_pulse()
+    def on_leave(self): self._stop_pulse()
 
     def _start_pulse(self):
-        """Pulse the LIVE indicator every second to show the thread is alive."""
         self._stop_pulse()
-        self._pulse_state = True
         def _tick(dt):
             try:
-                self.live_dot.color = LIVE_GREEN if self._pulse_state \
-                                      else (*LIVE_GREEN[:3], 0.25)
-                self._pulse_state = not self._pulse_state
-            except Exception:
-                pass
-        self._pulse_event = Clock.schedule_interval(_tick, 1.0)
+                self.live_dot.color=LIVE if self._pulse_st else (*LIVE[:3],.25)
+                self._pulse_st=not self._pulse_st
+            except Exception: pass
+        self._pulse_ev=Clock.schedule_interval(_tick,1.0)
 
     def _stop_pulse(self):
-        if self._pulse_event:
-            self._pulse_event.cancel()
-            self._pulse_event = None
+        if self._pulse_ev: self._pulse_ev.cancel(); self._pulse_ev=None
 
-    def set_status(self, text: str, color=SUCCESS):
-        try:
-            self.status_lbl.text  = text
-            self.status_lbl.color = color
+    def set_status(self,text,color=GREEN):
+        try: self.st_lbl.text=text; self.st_lbl.color=color
         except Exception: pass
 
-    def set_poll_mode(self, long_poll: bool):
+    def set_mode(self,lp):
         try:
-            if long_poll:
-                self.mode_lbl.text  = "Mode: ⚡ Long-Poll  (~150 ms delivery)"
-                self.mode_lbl.color = ACCENT
-            else:
-                self.mode_lbl.text  = "Mode: Short-Poll  (2 s interval)"
-                self.mode_lbl.color = WARN_COL
+            if lp: self.mode_lbl.text="Mode: ⚡ Long-Poll (~300ms)"; self.mode_lbl.color=ACC
+            else:  self.mode_lbl.text="Mode: Short-Poll (2s)";       self.mode_lbl.color=WARN
         except Exception: pass
 
-    def on_reset(self, *_):
-        store_delete('device')
+    def _reset(self,*_):
+        store_del('device')
         App.get_running_app().stop_polling()
-        try:
-            app = App.get_running_app()
-            app.sm.transition = FadeTransition()
-            app.sm.current    = 'key_entry'
-        except Exception as e:
-            print(f"[UI] reset error: {e}")
+        app=App.get_running_app()
+        app.sm.transition=FadeTransition(); app.sm.current='key_entry'
 
 
 # ============================================================
-# MAIN APP
+# APP
 # ============================================================
 class BuddyGuardApp(App):
-    def __init__(self, **kw):
+    def __init__(self,**kw):
         super().__init__(**kw)
-        self.poller:    UltraFastPoller | None = None
-        self.hb_thread: HeartbeatThread  | None = None
-        self.sm:        ScreenManager    | None = None
+        self.poller:Poller|None=None
+        self.hb:HBThread|None=None
+        self.sm:ScreenManager|None=None
 
     def build(self):
-        Window.clearcolor = BG_DARK
-        self.sm = ScreenManager()
-        self.sm.add_widget(KeyEntryScreen(name='key_entry'))
+        Window.clearcolor=DARK
+        self.sm=ScreenManager()
+        self.sm.add_widget(KeyScreen(name='key_entry'))
         self.sm.add_widget(HomeScreen(name='home'))
-
-        if store_exists('device') and store_get('device', 'paired', False):
-            self.sm.current = 'home'
-            # ⚡ Start polling in 0.5 s (was 1.5 s)
-            Clock.schedule_once(lambda dt: self.start_polling(), 0.5)
+        if store_has('device') and store_get('device','paired',False):
+            self.sm.current='home'
+            Clock.schedule_once(lambda dt:self.start_polling(), 0.4)
         else:
-            self.sm.current = 'key_entry'
-
-        if IS_ANDROID and _android_ok:
+            self.sm.current='key_entry'
+        if IS_ANDROID and _perms_ok:
             try:
                 request_permissions([
-                    Permission.CAMERA,
-                    Permission.RECORD_AUDIO,
+                    Permission.CAMERA,Permission.RECORD_AUDIO,
                     Permission.WRITE_EXTERNAL_STORAGE,
                     Permission.READ_EXTERNAL_STORAGE,
                     Permission.POST_NOTIFICATIONS,
                 ])
-            except Exception as e:
-                print(f"[APP] Permission request error: {e}")
-
+            except Exception: pass
         return self.sm
 
     def start_polling(self):
-        try:
-            uid = store_get('device', 'device_uid')
-            if not uid:
-                print("[APP] No device_uid — polling not started")
-                return
-            self.stop_polling()
-
-            self.poller = UltraFastPoller(uid, self)
-            self.poller.start()
-
-            self.hb_thread = HeartbeatThread(uid)
-            self.hb_thread.start()
-
-            print(f"[APP] ⚡ Ultra-fast polling started | uid={uid}")
-            try:
-                self.sm.get_screen('home').set_status(
-                    "⚡ Connected — ultra-fast monitoring", SUCCESS)
-            except Exception:
-                pass
-        except Exception as e:
-            print(f"[APP] start_polling error: {e}\n{traceback.format_exc()}")
+        uid=store_get('device','uid')
+        if not uid: return
+        self.stop_polling()
+        self.poller=Poller(uid,self); self.poller.start()
+        self.hb=HBThread(uid);       self.hb.start()
+        try: self.sm.get_screen('home').set_status("⚡ Connected — real-time active",GREEN)
+        except Exception: pass
 
     def stop_polling(self):
         if self.poller:
             try: self.poller.stop()
             except Exception: pass
-            self.poller = None
-        if self.hb_thread:
-            try: self.hb_thread.stop()
+            self.poller=None
+        if self.hb:
+            try: self.hb.stop()
             except Exception: pass
-            self.hb_thread = None
+            self.hb=None
 
     def on_stop(self):
         self.stop_polling()
-        release_wakelock()
+        _release_wl()
 
 
-# ============================================================
-# ENTRY POINT
-# ============================================================
-if __name__ == '__main__':
+if __name__=='__main__':
     BuddyGuardApp().run()
