@@ -12,7 +12,7 @@
 # ERROR HANDLING STRATEGY:
 #   - SSL: 3-layer fallback (certifi → system CA → no-verify)
 #   - Network: retry loop with exponential backoff
-#   - Android s: every call wrapped, fallback to stub
+#   - Android APIs: every call wrapped, fallback to stub
 #   - JSON: safe parser, never crashes on bad response
 #   - Storage: every read/write guarded
 #   - Polling thread: auto-restarts on any crash
@@ -102,7 +102,7 @@ from kivy.storage.jsonstore import JsonStore
 # ============================================================
 # CONFIG
 # ============================================================
-API_BASE   = "https://mirab.ayamilcoders.com/api.php"  # ← Change this
+API_BASE   = "https://yourdomain.com/api.php"  # ← Change this
 POLL_SECS  = 30
 STORE_FILE = "buddy_device.json"
 
