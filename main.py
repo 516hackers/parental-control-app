@@ -892,7 +892,7 @@ class KeyScreen(Screen):
 
                 if r.get('success'):
                     store_put('device',
-                              key=key,
+                              pair_key=key,
                               uid=uid,
                               dev_id=r.get('device_id', 0),
                               paired=True)
