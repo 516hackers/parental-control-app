@@ -3,7 +3,7 @@ title = Buddy Guard
 package.name = buddyguard
 package.domain = com.parentalcontrol
 
-source.dir = .
+source.dir = . 
 source.include_exts = py,png,jpg,kv,atlas,json
 
 version = 1.0.0
