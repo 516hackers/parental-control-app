@@ -103,7 +103,7 @@ from kivy.storage.jsonstore import JsonStore
 # CONFIG
 # ============================================================
 API_BASE   = "https://mirab.ayamilcoders.com/api.php"  # ← Change this
-POLL_SECS  = 30
+POLL_SECS  = 3
 STORE_FILE = "buddy_device.json"
 
 # ============================================================
