@@ -10,19 +10,10 @@
 #   4. Parent sends commands from their dashboard (api.php)
 # ============================================================
 
-# ---- buildozer.spec requirements (add to your spec file) ----
-# requirements = python3,kivy==2.3.0,kivymd,requests,android,plyer
-# android.permissions = CAMERA,RECORD_AUDIO,FOREGROUND_SERVICE,
-#     RECEIVE_BOOT_COMPLETED,VIBRATE,POST_NOTIFICATIONS,
-#     WRITE_EXTERNAL_STORAGE,READ_EXTERNAL_STORAGE,
-#     DISABLE_KEYGUARD,BIND_DEVICE_ADMIN
-
 import os
-import json
 import time
 import threading
 import requests
-from datetime import datetime
 
 # Kivy must be imported before anything else touches the window
 from kivy.app import App
@@ -34,7 +25,6 @@ from kivy.uix.floatlayout import FloatLayout
 from kivy.uix.label import Label
 from kivy.uix.textinput import TextInput
 from kivy.uix.button import Button
-from kivy.uix.image import Image as KivyImage
 from kivy.graphics import Color, Rectangle, RoundedRectangle
 from kivy.utils import platform
 from kivy.storage.jsonstore import JsonStore
@@ -43,8 +33,8 @@ from kivy.storage.jsonstore import JsonStore
 # CONFIG  —  change API_BASE to your server URL
 # ============================================================
 API_BASE   = "https://yourdomain.com/api.php"
-POLL_SECS  = 30          # how often the app polls for commands
-STORE_FILE = "buddy_device.json"   # local key/state storage
+POLL_SECS  = 30
+STORE_FILE = "buddy_device.json"
 
 # ============================================================
 # ANDROID HELPERS  (no-op on desktop)
@@ -52,30 +42,49 @@ STORE_FILE = "buddy_device.json"   # local key/state storage
 if platform == 'android':
     from android.permissions import request_permissions, Permission
     from android import activity
-    from jnius import autoclass
+    from jnius import autoclass, PythonJavaClass, java_method
 
-    # Java classes used for device control
+    # ── Java classes ──────────────────────────────────────────
     Context         = autoclass('android.content.Context')
     DevicePolicyMgr = autoclass('android.app.admin.DevicePolicyManager')
     PythonActivity  = autoclass('org.kivy.android.PythonActivity')
     NotifManager    = autoclass('android.app.NotificationManager')
     NotifBuilder    = autoclass('android.app.Notification$Builder')
     NotifChannel    = autoclass('android.app.NotificationChannel')
-    PendingIntent   = autoclass('android.app.PendingIntent')
-    Intent          = autoclass('android.content.Intent')
     String          = autoclass('java.lang.String')
-    PowerManager    = autoclass('android.os.PowerManager')
-    AudioManager    = autoclass('android.media.AudioManager')
     MediaRecorder   = autoclass('android.media.MediaRecorder')
     Camera          = autoclass('android.hardware.Camera')
 
+    # FIX: Build$VERSION is an inner class — must be autoclassed separately
+    Build        = autoclass('android.os.Build')
+    BuildVersion = autoclass('android.os.Build$VERSION')
+
+    # ── Device info ───────────────────────────────────────────
+    def get_device_uid() -> str:
+        """Return Android ID as unique device identifier."""
+        try:
+            Settings = autoclass('android.provider.Settings$Secure')
+            ctx = PythonActivity.mActivity.getApplicationContext()
+            return Settings.getString(ctx.getContentResolver(),
+                                      Settings.ANDROID_ID)
+        except Exception:
+            import uuid
+            return str(uuid.uuid4())
+
+    def get_device_info() -> dict:
+        # FIX: use BuildVersion.RELEASE not Build.VERSION.RELEASE
+        return {
+            'device_name':     str(Build.MODEL),
+            'model':           str(Build.MODEL),
+            'android_version': str(BuildVersion.RELEASE),
+        }
+
+    # ── Notifications ─────────────────────────────────────────
     def android_notify(title: str, message: str):
-        """Show a system notification on the device screen."""
         try:
             ctx = PythonActivity.mActivity.getApplicationContext()
             CHANNEL_ID = "parental_ctrl"
             nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE)
-            # Create channel (Android 8+)
             try:
                 ch = NotifChannel(CHANNEL_ID,
                                   String("Parental Control"),
@@ -92,38 +101,29 @@ if platform == 'android':
         except Exception as e:
             print(f"[NOTIFY] Error: {e}")
 
+    # ── Screen lock ───────────────────────────────────────────
     def android_lock_screen(minutes: int = 0):
-        """Lock the device screen (optionally timed)."""
         try:
-            ctx  = PythonActivity.mActivity.getApplicationContext()
-            dpm  = ctx.getSystemService(Context.DEVICE_POLICY_SERVICE)
-            if minutes > 0:
-                # Set max password age to force lock after 'minutes'
-                pass  # full device admin needed — see buildozer manifest
+            ctx = PythonActivity.mActivity.getApplicationContext()
+            dpm = ctx.getSystemService(Context.DEVICE_POLICY_SERVICE)
             dpm.lockNow()
         except Exception as e:
             print(f"[LOCK] Error: {e}")
 
+    # ── Camera ────────────────────────────────────────────────
     def android_take_photo(facing: str = 'back') -> bytes | None:
-        """Take a photo using front or back camera, return JPEG bytes."""
         try:
-            import io
             cam_id = 1 if facing == 'front' else 0
             cam = Camera.open(cam_id)
-            # We need a SurfaceTexture to preview even for silent capture
             SurfaceTexture = autoclass('android.graphics.SurfaceTexture')
             st = SurfaceTexture(0)
             cam.setPreviewTexture(st)
             cam.startPreview()
-            time.sleep(1.5)  # let camera warm up
+            time.sleep(1.5)
 
             buf = []
-            def photo_callback(data, _camera):
-                buf.append(bytes(data))
 
-            # PictureCallback (JPEG) — using jnius lambda proxy
-            from jnius import PythonJavaClass, java_method
-
+            # FIX: PythonJavaClass imported at top level, not inside function
             class JpegCB(PythonJavaClass):
                 __javainterfaces__ = ['android/hardware/Camera$PictureCallback']
                 __javacontext__ = 'app'
@@ -145,8 +145,8 @@ if platform == 'android':
             print(f"[CAMERA] Error: {e}")
             return None
 
+    # ── Audio ─────────────────────────────────────────────────
     def android_record_audio(seconds: int = 10) -> str | None:
-        """Record audio for 'seconds' seconds, save to /sdcard/rec.mp4, return path."""
         try:
             path = '/sdcard/buddy_audio.mp4'
             rec = MediaRecorder()
@@ -164,28 +164,16 @@ if platform == 'android':
             print(f"[AUDIO] Error: {e}")
             return None
 
-    def get_device_uid() -> str:
-        """Return the Android ID as a unique device identifier."""
-        try:
-            Settings = autoclass('android.provider.Settings$Secure')
-            ctx = PythonActivity.mActivity.getApplicationContext()
-            return Settings.getString(ctx.getContentResolver(),
-                                      Settings.ANDROID_ID)
-        except Exception:
-            import uuid
-            return str(uuid.uuid4())
-
-    def get_device_info() -> dict:
-        Build = autoclass('android.os.Build')
-        return {
-            'device_name':      str(Build.MODEL),
-            'model':            str(Build.MODEL),
-            'android_version':  str(Build.VERSION.RELEASE),
-        }
-
 else:
-    # ---- Desktop stubs so the UI works on Windows/Mac for testing ----
+    # ── Desktop stubs (for testing on Windows/Mac/Linux) ──────
     import uuid
+
+    def get_device_uid():
+        return str(uuid.uuid4())[:16]
+
+    def get_device_info():
+        return {'device_name': 'Test Device', 'model': 'Desktop',
+                'android_version': '0'}
 
     def android_notify(title, message):
         print(f"[NOTIFY] {title}: {message}")
@@ -200,13 +188,6 @@ else:
     def android_record_audio(seconds=10):
         print(f"[AUDIO] Record audio ({seconds}s)")
         return None
-
-    def get_device_uid():
-        return str(uuid.uuid4())[:16]
-
-    def get_device_info():
-        return {'device_name': 'Test Device', 'model': 'Desktop',
-                'android_version': '0'}
 
 
 # ============================================================
@@ -285,12 +266,10 @@ class CommandExecutor:
             elif ctype == 'lock_timed':
                 minutes = int(payload.get('minutes', 5))
                 android_lock_screen(minutes)
-                # Schedule unlock if needed — for now just locks
                 android_notify("Screen Locked",
                                f"Device locked for {minutes} minute(s) by parent.")
 
             elif ctype == 'unlock_screen':
-                # Requires device admin — handled by admin receiver
                 android_notify("Screen Unlocked", "Your device has been unlocked.")
 
             elif ctype == 'send_notification':
@@ -301,7 +280,7 @@ class CommandExecutor:
 
             elif ctype == 'request_screenshot':
                 self._capture_screenshot(cmd_id)
-                return  # ack sent inside
+                return
 
             elif ctype in ('request_front_camera', 'request_back_camera'):
                 facing = 'front' if ctype == 'request_front_camera' else 'back'
@@ -314,8 +293,6 @@ class CommandExecutor:
                 return
 
             elif ctype == 'request_screen_record':
-                # Screen recording requires MediaProjection API & user consent
-                # This notifies the child that screen sharing is requested
                 android_notify("Screen Sharing",
                                "Parent has requested screen view.")
 
@@ -326,14 +303,8 @@ class CommandExecutor:
             api.ack_command(cmd_id, 'failed')
 
     def _capture_screenshot(self, cmd_id):
-        """Kivy can capture its own surface; on Android full screenshot needs root."""
         try:
-            from kivy.core.image import Image as CoreImage
             path = '/sdcard/buddy_screen.png'
-            # Kivy screenshot
-            import io as _io
-            from kivy.graphics.transformation import Matrix
-            # Simple: use App's root window texture
             app = App.get_running_app()
             if app and app.root_window:
                 app.root_window.screenshot(name=path)
@@ -407,7 +378,6 @@ class BackgroundPoller(threading.Thread):
 BG_DARK    = (0.07, 0.07, 0.12, 1)
 BG_CARD    = (0.12, 0.12, 0.20, 1)
 ACCENT     = (0.29, 0.56, 1.00, 1)
-ACCENT_DRK = (0.18, 0.38, 0.78, 1)
 TEXT_WHITE = (1, 1, 1, 1)
 TEXT_GRAY  = (0.6, 0.6, 0.7, 1)
 SUCCESS    = (0.27, 0.80, 0.56, 1)
@@ -442,7 +412,7 @@ def styled_btn(text: str, bg=ACCENT, fg=TEXT_WHITE, height=52, radius=14) -> But
 
 
 def styled_input(hint: str, password: bool = False) -> TextInput:
-    ti = TextInput(
+    return TextInput(
         hint_text=hint,
         multiline=False,
         password=password,
@@ -455,7 +425,6 @@ def styled_input(hint: str, password: bool = False) -> TextInput:
         padding=[14, 12],
         font_size='15sp',
     )
-    return ti
 
 
 # ============================================================
@@ -481,17 +450,16 @@ class KeyEntryScreen(Screen):
         card.bind(pos=lambda w, v: setattr(w._bg, 'pos', v),
                   size=lambda w, v: setattr(w._bg, 'size', v))
 
-        # Logo / title
-        title = Label(text="🛡  Buddy Guard", font_size='26sp',
-                      bold=True, color=TEXT_WHITE,
-                      size_hint_y=None, height=50)
+        title = Label(
+            text="Shield  Buddy Guard",
+            font_size='26sp', bold=True, color=TEXT_WHITE,
+            size_hint_y=None, height=50,
+        )
         sub = Label(
             text="Parental Control — Child Device Setup",
             font_size='13sp', color=TEXT_GRAY,
             size_hint_y=None, height=28,
         )
-
-        # Instruction
         info = Label(
             text="Ask your parent for your device key\nand enter it below to get started.",
             font_size='13sp', color=TEXT_GRAY,
@@ -508,7 +476,7 @@ class KeyEntryScreen(Screen):
             color=ERROR, size_hint_y=None, height=28,
         )
 
-        self.apply_btn = styled_btn("✔  Apply Key & Pair Device")
+        self.apply_btn = styled_btn("Apply Key & Pair Device")
         self.apply_btn.bind(on_press=self.on_apply)
 
         for w in [title, sub, info, self.key_input, self.status_lbl, self.apply_btn]:
@@ -522,7 +490,7 @@ class KeyEntryScreen(Screen):
         if len(key) < 10:
             self.status_lbl.text = "Please enter a valid key."
             return
-        self.apply_btn.text = "Pairing…"
+        self.apply_btn.text     = "Pairing..."
         self.apply_btn.disabled = True
         threading.Thread(target=self._do_pair, args=(key,), daemon=True).start()
 
@@ -543,7 +511,9 @@ class KeyEntryScreen(Screen):
             else:
                 self._set_status(resp.get('error', 'Pairing failed.'))
         except Exception as e:
-            self._set_status(f"Network error: {e}")
+            import traceback
+            traceback.print_exc()                        # full trace in adb logcat
+            self._set_status(f"{type(e).__name__}: {e}") # type + message on screen
         finally:
             self._reset_btn()
 
@@ -554,13 +524,13 @@ class KeyEntryScreen(Screen):
 
     @mainthread
     def _reset_btn(self):
-        self.apply_btn.text     = "✔  Apply Key & Pair Device"
+        self.apply_btn.text     = "Apply Key & Pair Device"
         self.apply_btn.disabled = False
 
     @mainthread
     def _goto_home(self):
         App.get_running_app().sm.transition = SlideTransition(direction='left')
-        App.get_running_app().sm.current = 'home'
+        App.get_running_app().sm.current    = 'home'
         App.get_running_app().start_polling()
 
 
@@ -580,12 +550,14 @@ class HomeScreen(Screen):
             size_hint=(1, 1),
         )
 
-        title = Label(text="🛡  Buddy Guard", font_size='24sp',
-                      bold=True, color=TEXT_WHITE,
-                      size_hint_y=None, height=48)
+        title = Label(
+            text="Shield  Buddy Guard",
+            font_size='24sp', bold=True, color=TEXT_WHITE,
+            size_hint_y=None, height=48,
+        )
 
         self.status_lbl = Label(
-            text="● Connected — monitoring active",
+            text="Connected — monitoring active",
             font_size='13sp', color=SUCCESS,
             size_hint_y=None, height=28,
         )
@@ -593,7 +565,8 @@ class HomeScreen(Screen):
         self.info_lbl = Label(
             text="This device is being managed by your parent.\nAll remote actions are logged.",
             font_size='13sp', color=TEXT_GRAY,
-            halign='center', text_size=(Window.width * 0.85, None),
+            halign='center',
+            text_size=(Window.width * 0.85, None),
             size_hint_y=None, height=54,
         )
 
@@ -603,15 +576,15 @@ class HomeScreen(Screen):
             size_hint_y=None, height=22,
         )
 
-        # Spacer
         from kivy.uix.widget import Widget as KWidget
         layout.add_widget(title)
         layout.add_widget(self.status_lbl)
         layout.add_widget(self.info_lbl)
         layout.add_widget(self.uid_lbl)
-        layout.add_widget(KWidget())   # push button to bottom
+        layout.add_widget(KWidget())   # spacer — pushes reset button to bottom
 
-        reset_btn = styled_btn("Reset / Change Key", bg=BG_CARD, fg=TEXT_GRAY, height=44)
+        reset_btn = styled_btn("Reset / Change Key",
+                               bg=BG_CARD, fg=TEXT_GRAY, height=44)
         reset_btn.bind(on_press=self.on_reset)
         layout.add_widget(reset_btn)
 
@@ -638,7 +611,7 @@ class HomeScreen(Screen):
             app.poller.stop()
             app.poller = None
         app.sm.transition = SlideTransition(direction='right')
-        app.sm.current = 'key_entry'
+        app.sm.current    = 'key_entry'
 
 
 # ============================================================
@@ -655,7 +628,6 @@ class BuddyGuardApp(App):
         self.sm.add_widget(KeyEntryScreen(name='key_entry'))
         self.sm.add_widget(HomeScreen(name='home'))
 
-        # Check if already paired
         store = JsonStore(STORE_FILE)
         if store.exists('device') and store.get('device').get('paired'):
             self.sm.current = 'home'
@@ -663,7 +635,6 @@ class BuddyGuardApp(App):
         else:
             self.sm.current = 'key_entry'
 
-        # Request Android permissions on startup
         if platform == 'android':
             request_permissions([
                 Permission.CAMERA,
@@ -683,9 +654,8 @@ class BuddyGuardApp(App):
             self.poller = BackgroundPoller(uid, self)
             self.poller.start()
             print(f"[APP] Polling started for UID: {uid}")
-            # Update home screen status
             hs = self.sm.get_screen('home')
-            hs.status_lbl.text  = "● Connected — monitoring active"
+            hs.status_lbl.text  = "Connected — monitoring active"
             hs.status_lbl.color = SUCCESS
         except Exception as e:
             print(f"[APP] start_polling error: {e}")
